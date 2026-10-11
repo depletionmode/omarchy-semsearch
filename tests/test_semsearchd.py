@@ -139,6 +139,29 @@ def test_prefix_only_when_the_word_itself_is_absent(tmp_path):
     assert [h["name"] for h in index.search("travers", semantic=False)] == ["breadth.txt"]
 
 
+def test_a_longer_word_is_not_a_word_match(tmp_path):
+    index = make_index(tmp_path)
+    (tmp_path / "bank.txt").write_text("your account number and account name")
+    index.index_file(str(tmp_path / "bank.txt"))
+    assert index.search("accountant", semantic=False) == []
+    assert "<b>" not in sd.snippet("your account number", ["accountant"])
+
+    # The other way round is a word being typed, and does match.
+    hit = index.search("accou", semantic=False)[0]
+    assert (hit["name"], hit["why"]) == ("bank.txt", "words")
+
+
+def test_word_index_is_rebuilt_when_its_tokenizer_changes(tmp_path):
+    index = make_index(tmp_path)
+    with index.db:
+        index.db.execute("DROP TABLE fts")
+        index.db.execute("CREATE VIRTUAL TABLE fts USING fts5(title, body, tokenize='porter unicode61')")
+        index.db.execute("UPDATE meta SET value='old' WHERE key='fts'")
+    rebuilt = sd.Index(index.db, FakeEmbedder())
+    assert [h["name"] for h in rebuilt.search("burst pipe", semantic=False)] == ["insurance.txt"]
+    assert [h["name"] for h in rebuilt.search("insurance", semantic=False)] == ["insurance.txt"]
+
+
 def test_unrelated_query_finds_nothing(tmp_path):
     index = make_index(tmp_path)
     assert index.search("zeppelin") == []

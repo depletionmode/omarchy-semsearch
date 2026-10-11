@@ -99,8 +99,10 @@ def query_terms(query):
 
 
 def is_match(word, terms):
+    """Whether a word is one of the query's terms, or the rest of one still
+    being typed. Never the other way round: "accountant" is not "account"."""
     w = word.lower()
-    return any(w.startswith(t) or (len(w) >= 4 and t.startswith(w)) for t in terms)
+    return any(w.startswith(t) for t in terms)
 
 
 def snippet(text, terms, width=170):
@@ -322,8 +324,11 @@ CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, mtime
 CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY, file_id INTEGER, image INTEGER, page INTEGER,
                                   w0 INTEGER, w1 INTEGER, text TEXT, vec BLOB);
 CREATE INDEX IF NOT EXISTS chunks_file ON chunks(file_id);
-CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(title, body, tokenize='porter unicode61');
 """
+
+# No stemming: a word match means the word itself. Related forms are the
+# embedding's job, and are then labelled as a match by meaning.
+FTS = "CREATE VIRTUAL TABLE fts USING fts5(title, body, tokenize='unicode61')"
 
 
 class Index:
@@ -341,6 +346,30 @@ class Index:
         self.stale = True
         with self.lock, self.db:
             self.db.executescript(SCHEMA)
+            self._ensure_fts()
+
+    def _ensure_fts(self):
+        """Create the word index, or rebuild it from the stored passages when
+        it was made by a version that tokenized differently."""
+        row = self.db.execute("SELECT value FROM meta WHERE key='fts'").fetchone()
+        if row and row[0] == FTS:
+            return
+        self.db.execute("DROP TABLE IF EXISTS fts")
+        self.db.execute(FTS)
+        first = set()
+        for chunk_id, file_id, path, text in self.db.execute(
+            "SELECT c.id, c.file_id, f.path, c.text FROM chunks c JOIN files f ON f.id = c.file_id ORDER BY c.id"
+        ).fetchall():
+            self._add_words(chunk_id, path if file_id not in first else "", text)
+            first.add(file_id)
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES('fts', ?)", (FTS,))
+
+    def _add_words(self, chunk_id, path, text):
+        # The path is searchable too, on a file's first passage only so a
+        # folder name matches each document in it once.
+        self.db.execute(
+            "INSERT INTO fts(rowid, title, body) VALUES(?,?,?)", (chunk_id, path.removeprefix(HOME), text)
+        )
 
     def reset_if_model_changed(self, model):
         with self.lock, self.db:
@@ -399,12 +428,7 @@ class Index:
                     "INSERT INTO chunks(file_id, image, page, w0, w1, text, vec) VALUES(?,?,?,?,?,?,?)",
                     (file_id, image, page, w0, w1, text, vec.astype(np.float32).tobytes()),
                 ).lastrowid
-                # The path is searchable too, on the first passage only so a
-                # folder name matches each document in it once.
-                self.db.execute(
-                    "INSERT INTO fts(rowid, title, body) VALUES(?,?,?)",
-                    (chunk_id, path.removeprefix(HOME) if n == 0 else "", text),
-                )
+                self._add_words(chunk_id, path if n == 0 else "", text)
             self.stale = True
 
     def _delete(self, path):
