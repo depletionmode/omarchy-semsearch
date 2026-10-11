@@ -20,8 +20,8 @@ def test_windows_cover_every_word_and_overlap():
     spans = sd.windows(400, size=180, overlap=30)
     assert spans[0] == (0, 180)
     assert spans[-1][1] == 400
-    for (a0, a1), (b0, b1) in zip(spans, spans[1:]):
-        assert b0 == a1 - 30
+    for (_, end), (start, _) in zip(spans, spans[1:]):
+        assert start == end - 30
 
 
 def test_windows_short_and_empty():
@@ -197,6 +197,19 @@ def test_similarity_is_measured_from_the_corpus_mean(tmp_path):
     hits = index.search("pipe")
     assert [h["name"] for h in hits] == ["leak.txt"]
 
+    # One picture is too few for a mean of its own, so it borrows the index's.
+    # Left uncentred it would score 0.99 against every query alike.
+    from PIL import Image
+
+    Image.new("RGB", (80, 80), "orange").save(tmp_path / "IMG_1.png")
+    index.index_file(str(tmp_path / "IMG_1.png"))
+
+    def score(query):
+        return max((h["score"] for h in index.search(query, kind="image")), default=0)
+
+    assert score("sunset") > 0.9
+    assert score("pipe") < 0.5
+
 
 def test_model_is_unloaded_only_after_the_idle_period():
     embedder = sd.LlamaEmbedder(dict(sd.DEFAULTS, idle_unload_seconds=300))
@@ -343,7 +356,7 @@ def test_listing_skips_hidden_excluded_and_unknown_files(tmp_path):
                 "node_modules/pkg/index.js", "go/pkg/mod/lib.go", "go/src/main.go", "movie.mkv"):
         write(tmp_path / rel)
     indexer = make_indexer(tmp_path)
-    found = {os.path.relpath(p, tmp_path) for p in indexer.listing(str(tmp_path))}
+    found = {os.path.relpath(p, tmp_path) for p in indexer.scan(str(tmp_path))[0]}
     assert found == {"notes.md", "sub/deep/app.py", "photo.png", "go/src/main.go"}
     assert indexer.wanted(str(tmp_path / "notes.md"))
     assert not indexer.wanted(str(tmp_path / ".config/tool.md"))
@@ -361,13 +374,13 @@ def test_inside_a_repository_only_what_git_does_not_ignore(tmp_path):
     write(tmp_path / "loose.txt")
 
     indexer = make_indexer(tmp_path)
-    found = {os.path.relpath(p, tmp_path) for p in indexer.listing(str(tmp_path))}
+    found = {os.path.relpath(p, tmp_path) for p in indexer.scan(str(tmp_path))[0]}
     # Untracked but not ignored counts: it is a file someone is writing.
     assert found == {"loose.txt", "project/src/main.py", "project/README.md", "project/untracked.py"}
     assert not indexer.wanted(str(repo / "build/out.js"))
     assert indexer.wanted(str(repo / "src/main.py"))
     # A folder created later inside the repository is listed the same way.
-    assert indexer.listing(str(repo / "build")) == []
+    assert indexer.scan(str(repo / "build"))[0] == []
 
 
 def test_watched_directories_are_every_folder_a_file_could_appear_in(tmp_path):

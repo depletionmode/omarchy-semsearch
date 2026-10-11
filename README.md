@@ -9,7 +9,8 @@ through [llama.cpp](https://github.com/ggml-org/llama.cpp), index in SQLite.
 
 ## Install
 
-Needs Omarchy 4 on x86-64 and about 1 GB of disk.
+Needs Omarchy 4 on x86-64 and about 1 GB of disk. `uv` and `poppler` are the
+only packages Omarchy does not already ship.
 
 ```bash
 sudo pacman -S --needed uv poppler
@@ -70,6 +71,10 @@ The kind only filters; the same hits are found either way. Hits are listed
 most similar first, whatever their kind, with word matches above them when
 those are on.
 
+| Code, by what it does | Pictures, by what they show |
+|---|---|
+| ![A code hit with its block and line numbers](docs/code.png) | ![Pictures matching "a chart"](docs/pictures.png) |
+
 From a terminal: `semsearch status`, `semsearch rescan`, `semsearch <query>`,
 with `-w` to include word matches and `-k text|code|image` to narrow (in the
 plugin folder).
@@ -124,6 +129,10 @@ min_image_similarity = 0.20
 min_code_similarity = 0.35
 ```
 
+The three `min_` values are the lowest similarity that counts as a match, as
+tuned on an index of about 15,000 passages and 4,000 pictures. They are
+scaled down for a smaller index and up for a larger one, by up to 30%.
+
 ## How it works
 
 `semsearchd` embeds every passage, code block and picture and stores text and
@@ -158,8 +167,8 @@ first start `uv` installs `numpy`, `inotify-simple` and `pillow` into its cache.
 
 ## Privacy
 
-The index holds the text of your documents in plain SQLite in your home
-directory. The daemon makes no network connections beyond a llama.cpp server
+The index holds the text of your documents and source files in plain SQLite
+in your home directory. The daemon makes no network connections beyond a llama.cpp server
 on a random `127.0.0.1` port; only `install.sh` downloads anything.
 
 ## Development

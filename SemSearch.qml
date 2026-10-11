@@ -181,7 +181,8 @@ Item {
   function openHit() {
     if (!root.hit) return
     // Opens a PDF at the matching page and source at the matching line.
-    Util.execArgv(["setsid", "uwsm-app", "--", root.openScript, root.hit.path, String(root.hit.page), String(root.hit.line)])
+    Util.execArgv(["setsid", "uwsm-app", "--", root.openScript,
+                   root.hit.path, String(root.hit.page), String(root.hit.line)])
     root.dismiss()
   }
 
@@ -203,12 +204,13 @@ Item {
 
   // --- Presentation ---------------------------------------------------------
 
+  // Nerd Font glyphs: code, image, PDF, word processor, plain text.
   function glyph(row) {
-    if (row.line) return ""
-    if (row.image) return ""
-    if (row.ext === "pdf") return ""
-    if (row.ext === "docx" || row.ext === "odt") return ""
-    return ""
+    if (row.line) return "\uf121"
+    if (row.image) return "\uf1c5"
+    if (row.ext === "pdf") return "\uf1c1"
+    if (row.ext === "docx" || row.ext === "odt") return "\uf1c2"
+    return "\uf15c"
   }
 
   function reason(why) {
@@ -380,7 +382,7 @@ Item {
           Text {
             id: lens
             anchors.verticalCenter: parent.verticalCenter
-            text: ""
+            text: "\uf002"
             color: root.accent
             font.family: root.fontFamily
             font.pixelSize: Style.font.heading
@@ -616,7 +618,6 @@ Item {
               anchors.left: parent.left
               anchors.right: parent.right
               height: Math.round(parent.height * 0.58)
-
               clip: true
 
               // A text passage fills the stage and a picture is fitted into it.
@@ -698,7 +699,6 @@ Item {
                   wrapMode: Text.Wrap
                   elide: Text.ElideRight
                 }
-
               }
 
               Rectangle {

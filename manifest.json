@@ -6,7 +6,7 @@
   "author": "David Kaplan",
   "license": "MIT",
   "repository": "https://github.com/depletionmode/omarchy-semsearch",
-  "description": "Find documents and pictures by what they say or show, with a local EmbeddingGemma 2 index.",
+  "description": "Find documents, source code and pictures by what they say, do or show, with a local EmbeddingGemma 2 index.",
   "kinds": [
     "overlay"
   ],

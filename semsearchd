@@ -7,9 +7,9 @@
 
 Indexes documents (as passages), source code (as function-sized blocks) and
 images, embeds them with EmbeddingGemma 2 through a llama-server it starts on
-demand, and answers JSON-lines requests on a unix socket. Ranking is by cosine
-similarity (the meaning, or what a picture shows), optionally fused with
-SQLite FTS5 (the literal words, in the text or the file path).
+demand, and answers JSON-lines requests on a unix socket. Hits are ranked by
+cosine similarity (the meaning, or what a picture shows); on request, literal
+word matches from SQLite FTS5 (in the text or the file path) are listed first.
 """
 
 import base64
@@ -34,6 +34,8 @@ import zipfile
 from pathlib import Path
 
 import numpy as np
+from inotify_simple import INotify, flags
+from PIL import Image
 
 HOME = str(Path.home())
 DATA = Path(os.environ.get("XDG_DATA_HOME", HOME + "/.local/share")) / "semsearch"
@@ -74,6 +76,12 @@ DEFAULTS = {
 # What a row of the index is, and what a search can be narrowed to.
 TEXT, IMAGE, CODE = 0, 1, 2
 KINDS = {"text": TEXT, "image": IMAGE, "code": CODE}
+
+# How many rows of each kind the similarity floors were tuned on. The best
+# score among unrelated rows rises with their number, roughly as the square
+# root of its logarithm, so a floor right for 15,000 passages hides real
+# matches among 50; search() scales the floors by that ratio, within limits.
+TUNED_ON = {TEXT: 15000, IMAGE: 4000, CODE: 15000}
 
 # Prompts from the google/embeddinggemma-2 model card.
 QUERY_PROMPT = "task: search result | query: "
@@ -251,8 +259,6 @@ def extract(path, max_pages):
 
 
 def image_size(path):
-    from PIL import Image
-
     with Image.open(path) as im:
         return im.size
 
@@ -260,8 +266,6 @@ def image_size(path):
 def image_input(path):
     """An image as a /v1/embeddings input item, downscaled: the vision encoder
     resamples to its own resolution anyway, and a 24 MP photo is slow to ship."""
-    from PIL import Image
-
     with Image.open(path) as im:
         im = im.convert("RGB")
         im.thumbnail((768, 768))
@@ -527,13 +531,13 @@ class Index:
                 for page, words in pages:
                     for w0, w1 in windows(len(words)):
                         passages.append((page, w0, w1, " ".join(words[w0:w1])))
-            # A passage already embedded elsewhere (a copy of the file, another
-            # worktree of the repository) keeps the vector it has.
             # The model reads about 2,000 tokens. Prose passages are far
             # shorter; a "passage" of paths, base64 or one-line data is not,
             # and is cut rather than sent whole. At the three characters a
             # token that such text manages, 4,000 characters still fit.
             prompts = [DOC_PROMPT.format(title=title, text=p[3][:4000]) for p in passages]
+            # A passage already embedded elsewhere (a copy of the file, another
+            # worktree of the repository) keeps the vector it has.
             hashes = [hashlib.blake2b(prompt.encode(), digest_size=12).digest() for prompt in prompts]
             vectors = [None] * len(prompts)
             with self.lock:
@@ -588,11 +592,15 @@ class Index:
                 # vector has norm ~0.8), which leaves unrelated passages at a
                 # cosine of ~0.55 and real matches barely above them. Taking
                 # the mean out, per kind, is what makes a threshold meaningful.
-                # With only a few rows the mean is just those rows, so it stays.
+                # A kind with only a few rows borrows the mean of the whole
+                # index, which is close (cosine ~0.9 between kinds): the mean
+                # of five pictures is mostly those five pictures. An index of
+                # only a few rows has no usable mean at all and is left as is.
                 self.means = {}
+                overall = matrix.mean(0) if len(rows) >= 20 else np.zeros(matrix.shape[1], np.float32)
                 for kind in (TEXT, IMAGE, CODE):
                     where = self.kinds == kind
-                    mean = matrix[where].mean(0) if where.sum() >= 20 else np.zeros(matrix.shape[1], np.float32)
+                    mean = matrix[where].mean(0) if where.sum() >= 20 else overall
                     self.means[kind] = mean
                     centred = matrix[where] - mean
                     matrix[where] = centred / np.maximum(np.linalg.norm(centred, axis=1, keepdims=True), 1e-9)
@@ -633,21 +641,22 @@ class Index:
             vectors = self.embedder.embed([QUERY_PROMPT + query] + [CODE_QUERY_PROMPT + query] * has_code)
             # Pictures get no window below the best one: their relevant scores
             # are spread too widely for that.
-            for ranks, kind, vector, floor, window in (
+            for found, of_kind, vector, floor, window in (
                 (by_meaning, TEXT, vectors[0], self.cfg["min_similarity"], 0.12),
                 (by_looks, IMAGE, vectors[0], self.cfg["min_image_similarity"], 1.0),
                 (by_code, CODE, vectors[-1], self.cfg["min_code_similarity"], 0.12),
             ):
-                where = np.flatnonzero(kinds == kind)
-                if not len(where) or only not in (None, kind):
+                where = np.flatnonzero(kinds == of_kind)
+                if not len(where) or only not in (None, of_kind):
                     continue
-                centred = vector - means[kind]
+                centred = vector - means[of_kind]
                 sims = matrix[where] @ (centred / np.linalg.norm(centred))
                 order = np.argsort(-sims)[:60]
                 # There is always a nearest neighbour; only ones near the
                 # best, and above the floor, count as hits.
+                floor *= min(1.3, max(0.7, (np.log(max(len(where), 2)) / np.log(TUNED_ON[of_kind])) ** 0.5))
                 floor = max(floor, sims[order[0]] - window)
-                ranks.update((int(ids[where[i]]), float(sims[i])) for i in order if sims[i] >= floor)
+                found.update((int(ids[where[i]]), float(sims[i])) for i in order if sims[i] >= floor)
 
         by_words = self._word_ranks(terms, " AND ") if words else {}
         if words and semantic and not (by_words or by_meaning or by_looks or by_code):
@@ -679,11 +688,11 @@ class Index:
                 continue  # a word match of another kind
             seen_files.add(row[0])
             seen_passages.add(row[9])
-            _, path, mtime, size, pages, page, text, kind, w0, _ = row
+            _, path, mtime, size, pages, page, text, of_kind, w0, _ = row
             directory, name = os.path.split(path)
             excerpt = snippet(text, terms)
             if chunk_id not in by_words:
-                why = "looks" if kind == IMAGE else "meaning"
+                why = "looks" if of_kind == IMAGE else "meaning"
             else:
                 why = "words" if "<b>" in excerpt else "name"
             hits.append({
@@ -696,8 +705,8 @@ class Index:
                 "pages": pages,
                 "mtime": int(mtime),
                 "size": size,
-                "line": w0 if kind == CODE else 0,
-                "image": kind == IMAGE,
+                "line": w0 if of_kind == CODE else 0,
+                "image": of_kind == IMAGE,
                 "why": why,
                 "score": round(scores[chunk_id], 3),
                 "snippet": excerpt,
@@ -801,6 +810,11 @@ class Indexer:
         safe = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]
         return subprocess.run(["git", *safe, "-C", directory, *args], capture_output=True, timeout=300)
 
+    def ignored(self, path):
+        """Whether git ignores a path; never, outside a repository."""
+        directory = os.path.dirname(path)
+        return self.repository(directory) and self.git(directory, "check-ignore", "-q", path).returncode == 0
+
     def git_files(self, directory):
         listing = self.git(directory, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
         return [os.path.join(directory, p) for p in listing.stdout.decode("utf-8", "replace").split("\0") if p]
@@ -812,14 +826,14 @@ class Indexer:
         candidates = []
         directories = set()
 
-        def repository(directory):
+        def add_repository(directory):
             for path in self.git_files(directory):
                 if not self.skipped(path):
                     candidates.append(path)
                     directories.add(os.path.dirname(path))
 
         if self.repository(top):
-            repository(top)
+            add_repository(top)
         else:
             stack = [top]
             while stack:
@@ -834,7 +848,7 @@ class Indexer:
                         continue
                     if entry.is_dir(follow_symlinks=False):
                         if os.path.exists(entry.path + "/.git"):
-                            repository(entry.path)
+                            add_repository(entry.path)
                         else:
                             stack.append(entry.path)
                     elif entry.is_file(follow_symlinks=False):
@@ -842,17 +856,9 @@ class Indexer:
         files = [p for p in candidates if self.index.kind_of(p) is not None and os.path.isfile(p)]
         return files, directories
 
-    def listing(self, top):
-        return self.scan(top)[0]
-
     def wanted(self, path):
         """The same question for one path, as the watcher needs to ask it."""
-        if self.index.kind_of(path) is None or self.skipped(path):
-            return False
-        directory = os.path.dirname(path)
-        if self.repository(directory):
-            return self.git(directory, "check-ignore", "-q", path).returncode != 0
-        return True
+        return self.index.kind_of(path) is not None and not self.skipped(path) and not self.ignored(path)
 
     # The queue.
 
@@ -916,8 +922,6 @@ class Indexer:
     def watch_directories(self, directories):
         if self.inotify is None:
             return
-        from inotify_simple import flags
-
         mask = flags.CLOSE_WRITE | flags.CREATE | flags.MOVED_TO | flags.MOVED_FROM | flags.DELETE | flags.ONLYDIR
         watched = set(self.watches.values())
         wanted = set()
@@ -932,8 +936,6 @@ class Indexer:
                 log("cannot watch %s: %s" % (directory, e))
 
     def watch(self):
-        from inotify_simple import INotify, flags
-
         self.inotify = INotify()
         self.reconcile()
         while True:
@@ -958,8 +960,7 @@ class Indexer:
                     # A new folder: watch it and what is in it, unless git
                     # ignores it. It is watched even while empty, since files
                     # usually arrive after the folder does.
-                    ignored = self.repository(directory) and self.git(directory, "check-ignore", "-q", path).returncode == 0
-                    if not self.skipped(path) and not ignored:
+                    if not self.skipped(path) and not self.ignored(path):
                         new, directories = self.scan(path)
                         inside = (d for d, _, _ in os.walk(path) if not self.skipped(d))
                         self.watch_directories(directories | set(inside))
