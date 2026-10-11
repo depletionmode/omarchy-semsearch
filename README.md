@@ -50,14 +50,17 @@ omarchy plugin remove depmod.semsearch
 | <kbd>Enter</kbd> | Open |
 | <kbd>Shift</kbd>+<kbd>Enter</kbd> | Show in the file manager |
 | <kbd>Ctrl</kbd>+<kbd>C</kbd> | Copy the path |
+| <kbd>Tab</kbd> | Also match literal words and file names (off by default) |
 | <kbd>Esc</kbd> | Clear the query, then close |
 
-Each hit says why it matched: it has your words, its name matches, it means
-something similar, or (pictures) it looks like what you described. A PDF opens
-in the preview on the matching page with the passage highlighted.
+A search is by meaning only until you press <kbd>Tab</kbd>, which adds
+passages that contain your words and files whose path does. Each hit says why
+it matched: it means something similar, it looks like what you described
+(pictures), it has your words, or its name matches. A PDF opens in the preview
+on the matching page with the passage highlighted.
 
 From a terminal: `semsearch status`, `semsearch rescan`, `semsearch <query>`
-(in the plugin folder).
+and `semsearch -w <query>` to include word matches (in the plugin folder).
 
 ## What is indexed
 
@@ -93,14 +96,15 @@ min_image_similarity = 0.29
 ## How it works
 
 `semsearchd` embeds every passage and picture and stores text and vectors in
-`~/.local/share/semsearch/index.db`. A query is ranked three ways and the
-lists are fused: literal words (SQLite FTS5, no stemming), passage meaning and
-picture content (cosine similarity after subtracting the corpus mean vector).
+`~/.local/share/semsearch/index.db`. A query is ranked by passage meaning and
+by picture content (cosine similarity after subtracting the corpus mean
+vector). With word matches on, literal words (SQLite FTS5, no stemming) are a
+third list, and the lists are fused by reciprocal rank.
 
 The model is loaded on demand and unloaded after five idle minutes. Searching
 loads only the text model (310 MB); the vision projector (555 MB) is loaded
-while pictures are being indexed. Until the model is ready a search is
-answered with the word matches alone. The overlay talks to the daemon over
+while pictures are being indexed. With word matches on, a search is answered
+with those alone until the model is ready. The overlay talks to the daemon over
 `$XDG_RUNTIME_DIR/semsearch.sock`.
 
 The daemon is a [`uv` script](https://docs.astral.sh/uv/guides/scripts/); on

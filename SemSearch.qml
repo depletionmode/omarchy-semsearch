@@ -21,6 +21,8 @@ Item {
   property var preview: ({})
   property var status: ({})
   property bool waiting: false
+  // Off: hits by meaning only. On: also the literal words and file paths.
+  property bool wordMatch: false
 
   // Replies are matched to the latest request of their kind, so an answer to
   // a query the user has since typed past is dropped.
@@ -125,7 +127,12 @@ Item {
   }
 
   function search() {
-    root.searchId = root.send({ op: "search", q: root.query.trim() })
+    root.searchId = root.send({ op: "search", q: root.query.trim(), words: root.wordMatch })
+  }
+
+  function toggleWordMatch() {
+    root.wordMatch = !root.wordMatch
+    root.setQuery(root.query)
   }
 
   function requestPreview() {
@@ -300,6 +307,8 @@ Item {
             else root.dismiss()
           } else if (Util.editsFilter(event, root.query)) {
             root.setQuery(Util.editedFilter(event, root.query))
+          } else if (event.key === Qt.Key_Tab) {
+            root.toggleWordMatch()
           } else if (event.key === Qt.Key_Up) {
             root.move(-1)
           } else if (event.key === Qt.Key_Down) {
@@ -351,7 +360,7 @@ Item {
             anchors.left: lens.right
             anchors.leftMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
-            width: Math.min(implicitWidth, parent.width - lens.width - Style.space(20))
+            width: Math.min(implicitWidth, parent.width - lens.width - modeChip.width - Style.space(40))
             text: root.query || "Search by meaning…"
             color: root.foreground
             opacity: root.query ? 1 : 0.45
@@ -374,6 +383,33 @@ Item {
               loops: Animation.Infinite
               NumberAnimation { to: 0; duration: 500; easing.type: Easing.InOutQuad }
               NumberAnimation { to: 1; duration: 500; easing.type: Easing.InOutQuad }
+            }
+          }
+
+          Rectangle {
+            id: modeChip
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            width: modeLabel.implicitWidth + Style.space(20)
+            height: modeLabel.implicitHeight + Style.space(10)
+            radius: root.cornerRadius
+            color: root.wordMatch ? root.selectedBackground : Util.alpha(root.foreground, 0.06)
+
+            Text {
+              id: modeLabel
+              textFormat: Text.PlainText
+              anchors.centerIn: parent
+              text: root.wordMatch ? "Meaning + words" : "Meaning"
+              color: root.wordMatch ? root.accent : root.foreground
+              opacity: root.wordMatch ? 1 : 0.6
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.toggleWordMatch()
             }
           }
 
@@ -764,7 +800,7 @@ Item {
             textFormat: Text.PlainText
             anchors.right: parent.right
             anchors.bottom: parent.bottom
-            text: "↵ Open    ⇧↵ Show in folder    ^C Copy path"
+            text: "⇥ Word matches " + (root.wordMatch ? "on" : "off") + "    ↵ Open    ⇧↵ Show in folder    ^C Copy path"
             color: root.foreground
             opacity: 0.5
             font.family: root.fontFamily

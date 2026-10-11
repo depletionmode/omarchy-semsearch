@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Command-line client for semsearchd: semsearch status | rescan | <query>"""
+"""Command-line client for semsearchd: semsearch status | rescan | [-w] <query>
+
+-w also matches the literal words and file paths."""
 import json
 import os
 import socket
 import sys
 
-arg = " ".join(sys.argv[1:]) or "status"
-req = {"id": 1, "op": arg} if arg in ("status", "rescan") else {"id": 1, "op": "search", "q": arg}
+words = sys.argv[1:2] == ["-w"]
+arg = " ".join(sys.argv[2 if words else 1:]) or "status"
+req = {"id": 1, "op": arg} if arg in ("status", "rescan") else {"id": 1, "op": "search", "q": arg, "words": words}
 s = socket.socket(socket.AF_UNIX)
 s.connect(os.environ["XDG_RUNTIME_DIR"] + "/semsearch.sock")
 s.sendall((json.dumps(req) + "\n").encode())

@@ -104,7 +104,7 @@ def make_index(tmp_path):
 
 def test_search_ranks_by_meaning_and_labels_reason(tmp_path):
     index = make_index(tmp_path)
-    hits = index.search("pipe")
+    hits = index.search("pipe", words=True)
     assert hits[0]["name"] == "insurance.txt"
     assert hits[0]["why"] == "words"
     assert "<b>pipe</b>" in hits[0]["snippet"]
@@ -117,37 +117,37 @@ def test_search_ranks_by_meaning_and_labels_reason(tmp_path):
 def test_words_alone_need_no_model(tmp_path):
     index = make_index(tmp_path)
     index.embedder = None  # any embed() call would raise
-    hits = index.search("burst pipe", semantic=False)
+    hits = index.search("burst pipe", semantic=False, words=True)
     assert [h["name"] for h in hits] == ["insurance.txt"]
 
 
 def test_any_term_matches_only_when_nothing_else_does(tmp_path):
     index = make_index(tmp_path)
     # "steam" and "quarter" never share a passage, and mean nothing to the model.
-    names = {h["name"] for h in index.search("steam quarter")}
+    names = {h["name"] for h in index.search("steam quarter", words=True)}
     assert names == {"sourdough.txt", "return.txt"}
 
     # "steam" is in the bread recipe, but the tax document is what is meant.
-    assert [h["name"] for h in index.search("steam tax")] == ["return.txt"]
+    assert [h["name"] for h in index.search("steam tax", words=True)] == ["return.txt"]
 
 
 def test_prefix_only_when_the_word_itself_is_absent(tmp_path):
     index = make_index(tmp_path)
     (tmp_path / "breadth.txt").write_text("breadth first traversal")
     index.index_file(str(tmp_path / "breadth.txt"))
-    assert [h["name"] for h in index.search("bread", semantic=False)] == ["sourdough.txt"]
-    assert [h["name"] for h in index.search("travers", semantic=False)] == ["breadth.txt"]
+    assert [h["name"] for h in index.search("bread", semantic=False, words=True)] == ["sourdough.txt"]
+    assert [h["name"] for h in index.search("travers", semantic=False, words=True)] == ["breadth.txt"]
 
 
 def test_a_longer_word_is_not_a_word_match(tmp_path):
     index = make_index(tmp_path)
     (tmp_path / "bank.txt").write_text("your account number and account name")
     index.index_file(str(tmp_path / "bank.txt"))
-    assert index.search("accountant", semantic=False) == []
+    assert index.search("accountant", semantic=False, words=True) == []
     assert "<b>" not in sd.snippet("your account number", ["accountant"])
 
     # The other way round is a word being typed, and does match.
-    hit = index.search("accou", semantic=False)[0]
+    hit = index.search("accou", semantic=False, words=True)[0]
     assert (hit["name"], hit["why"]) == ("bank.txt", "words")
 
 
@@ -158,8 +158,16 @@ def test_word_index_is_rebuilt_when_its_tokenizer_changes(tmp_path):
         index.db.execute("CREATE VIRTUAL TABLE fts USING fts5(title, body, tokenize='porter unicode61')")
         index.db.execute("UPDATE meta SET value='old' WHERE key='fts'")
     rebuilt = sd.Index(index.db, FakeEmbedder())
-    assert [h["name"] for h in rebuilt.search("burst pipe", semantic=False)] == ["insurance.txt"]
-    assert [h["name"] for h in rebuilt.search("insurance", semantic=False)] == ["insurance.txt"]
+    assert [h["name"] for h in rebuilt.search("burst pipe", semantic=False, words=True)] == ["insurance.txt"]
+    assert [h["name"] for h in rebuilt.search("insurance", semantic=False, words=True)] == ["insurance.txt"]
+
+
+def test_meaning_only_unless_words_are_asked_for(tmp_path):
+    index = make_index(tmp_path)
+    # "steam" is in the recipe and nowhere near any meaning the model knows.
+    assert index.search("steam") == []
+    assert [h["name"] for h in index.search("steam", words=True)] == ["sourdough.txt"]
+    assert index.search("pipe")[0]["why"] == "meaning"
 
 
 def test_unrelated_query_finds_nothing(tmp_path):
@@ -234,7 +242,7 @@ def test_image_found_by_what_it_shows_and_by_path(tmp_path):
     assert index.preview(hit["chunk"], "sunset")["aspect"] == 1.0
 
     # Nothing in the picture or its name says "holiday"; its folder does.
-    hit = index.search("holiday")[0]
+    hit = index.search("holiday", words=True)[0]
     assert (hit["name"], hit["why"]) == ("IMG_0042.png", "name")
 
     assert all(h["name"] != "icon.png" for h in index.search("sunset"))
