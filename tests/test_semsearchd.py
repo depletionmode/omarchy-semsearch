@@ -8,6 +8,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 path = str(Path(__file__).parent.parent / "semsearchd")
 loader = SourceFileLoader("semsearchd", path)
@@ -482,3 +483,52 @@ def test_index_is_readable_by_its_owner_alone(tmp_path, monkeypatch):
         db.close()
     finally:
         os.umask(previous)
+
+
+def test_text_is_only_sent_to_the_model_server_this_daemon_started(tmp_path):
+    """Whatever is listening on the socket has to be the child itself."""
+    import http.server
+    import socketserver
+    import threading
+
+    class Health(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "15")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+
+        def log_message(self, *args):
+            pass
+
+    class Server(socketserver.UnixStreamServer):
+        def get_request(self):  # http.server expects a client address pair
+            request, _ = super().get_request()
+            return request, ("local", 0)
+
+    embedder = sd.LlamaEmbedder(dict(sd.DEFAULTS, idle_unload_seconds=0))
+    embedder.socket = tmp_path / "model.sock"
+    server = Server(str(embedder.socket), Health)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        # Served by this very process, standing in for the child.
+        embedder.proc = type("Child", (), {"pid": os.getpid()})()
+        assert embedder._request("GET", "/health") == {"status": "ok"}
+
+        # Served by anyone else: refused before a byte of the request is sent.
+        embedder.proc = type("Child", (), {"pid": os.getpid() + 1})()
+        with pytest.raises(RuntimeError, match="not served by the llama-server"):
+            embedder._request("GET", "/health")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_zip_that_claims_to_be_huge_is_not_unpacked(tmp_path):
+    import zipfile
+
+    path = tmp_path / "bomb.docx"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("word/document.xml", "<w:t>word </w:t>" * (5 << 20))  # 80 MB of text in ~100 KB
+    assert path.stat().st_size < 1 << 20
+    assert sd.zipped_xml_words(str(path), "word/document.xml") == []

@@ -149,7 +149,8 @@ with those alone until the model is ready. The overlay talks to the daemon over
 `$XDG_RUNTIME_DIR/semsearch.sock`.
 
 The daemon is a [`uv` script](https://docs.astral.sh/uv/guides/scripts/); on
-first start `uv` installs `numpy`, `inotify-simple` and `pillow` into its cache.
+first start `uv` installs `numpy`, `inotify-simple` and `pillow` into its
+cache, at the versions and hashes pinned in `semsearchd.lock`.
 
 ## Limits
 
@@ -169,8 +170,10 @@ first start `uv` installs `numpy`, `inotify-simple` and `pillow` into its cache.
 
 The index holds the text of your documents and source files in plain SQLite
 in your home directory, readable by you alone (mode `0600`, in a `0700`
-directory), as are the rendered pages and the daemon's socket. The daemon makes no network connections beyond a llama.cpp server
-on a random `127.0.0.1` port; only `install.sh` downloads anything.
+directory), as are the rendered pages. The daemon opens no network ports and
+makes no network connections: the overlay talks to it, and it talks to
+llama.cpp, over unix sockets in your runtime directory. Only `install.sh`
+downloads anything.
 
 ## Development
 
