@@ -66,11 +66,16 @@ DEFAULTS = {
     "min_similarity": 0.35,
     # The same for a picture against a text query, which scores lower.
     "min_image_similarity": 0.29,
+    # The same when pictures are all that was asked for. Relevant pictures
+    # score anywhere from here up, and so does the odd irrelevant one, which
+    # is acceptable in a gallery someone chose to look at and not otherwise.
+    "min_gallery_similarity": 0.20,
     "min_code_similarity": 0.35,
 }
 
-# What a row of the index is.
+# What a row of the index is, and what a search can be narrowed to.
 TEXT, IMAGE, CODE = 0, 1, 2
+KINDS = {"text": TEXT, "image": IMAGE, "code": CODE}
 
 # Prompts from the google/embeddinggemma-2 model card.
 QUERY_PROMPT = "task: search result | query: "
@@ -613,9 +618,12 @@ class Index:
                 break
         return {r[0]: rank for rank, r in enumerate(rows)}
 
-    def search(self, query, limit=30, semantic=True, words=False):
+    def search(self, query, limit=30, semantic=True, words=False, kind=None):
         """Hits by meaning, and with words=True also by the literal words and
-        file paths. semantic=False leaves the model out of it."""
+        file paths. semantic=False leaves the model out of it. kind ("text",
+        "code" or "image") narrows the hits to documents, source or pictures."""
+        only = KINDS.get(kind)
+        gallery = only == IMAGE
         terms = query_terms(query)
         ids, kinds, matrix, means = self._vectors()
 
@@ -624,15 +632,18 @@ class Index:
         # is also asked for with the model's own code-retrieval prompt.
         by_meaning, by_looks, by_code = {}, {}, {}
         if semantic and len(ids):
-            has_code = bool((kinds == CODE).any())
+            has_code = only in (None, CODE) and bool((kinds == CODE).any())
             vectors = self.embedder.embed([QUERY_PROMPT + query] + [CODE_QUERY_PROMPT + query] * has_code)
+            # Among everything, a picture has to stand out to be shown. When
+            # pictures are what was asked for, the best of them are the answer.
+            looks = ("min_gallery_similarity", 1.0) if gallery else ("min_image_similarity", 0.05)
             for ranks, kind, vector, floor, window in (
                 (by_meaning, TEXT, vectors[0], self.cfg["min_similarity"], 0.12),
-                (by_looks, IMAGE, vectors[0], self.cfg["min_image_similarity"], 0.05),
+                (by_looks, IMAGE, vectors[0], self.cfg[looks[0]], looks[1]),
                 (by_code, CODE, vectors[-1], self.cfg["min_code_similarity"], 0.12),
             ):
                 where = np.flatnonzero(kinds == kind)
-                if not len(where):
+                if not len(where) or only not in (None, kind):
                     continue
                 centred = vector - means[kind]
                 sims = matrix[where] @ (centred / np.linalg.norm(centred))
@@ -669,6 +680,8 @@ class Index:
             # copies of a file would otherwise fill the list with one answer.
             if not row or row[0] in seen_files or (row[9] and row[9] in seen_passages):
                 continue
+            if only not in (None, row[7]):
+                continue  # a word match of another kind
             seen_files.add(row[0])
             seen_passages.add(row[9])
             _, path, mtime, size, pages, page, text, kind, w0, _ = row
@@ -978,7 +991,7 @@ class Handler(socketserver.StreamRequestHandler):
                 if req.get("op") == "search" and req.get("words") and not self.server.embedder.loaded():
                     # The words need no model: answer with those now, and
                     # again in full once it has loaded.
-                    hits = self.server.index.search(req["q"], semantic=False, words=True)
+                    hits = self.server.index.search(req["q"], semantic=False, words=True, kind=req.get("kind"))
                     self.reply(req, {"hits": hits, "partial": True})
                 resp = self.server.dispatch(req)
             except Exception as e:
@@ -1006,7 +1019,7 @@ class Server(socketserver.ThreadingUnixStreamServer):
     def dispatch(self, req):
         op = req.get("op")
         if op == "search":
-            return {"hits": self.index.search(req["q"], words=bool(req.get("words")))}
+            return {"hits": self.index.search(req["q"], words=bool(req.get("words")), kind=req.get("kind"))}
         if op == "preview":
             return {"preview": self.index.preview(req["chunk"], req.get("q", ""))}
         if op == "warm":

@@ -397,3 +397,25 @@ def test_live_changes_are_taken_before_the_backlog(tmp_path):
     indexer.enqueue(["/backlog/1"], urgent=True)  # already queued: not twice
     assert indexer.total == 3
     assert next(iter(indexer.urgent or indexer.pending)) == "/just/saved"
+
+
+def test_search_can_be_narrowed_to_one_kind(tmp_path):
+    from PIL import Image
+
+    index = make_index(tmp_path)
+    Image.new("RGB", (80, 80), "orange").save(tmp_path / "IMG_1.png")
+    (tmp_path / "ledger.py").write_text("def tax():\n    return 0.2  # sunset\n")
+    for name in ("IMG_1.png", "ledger.py"):
+        index.index_file(str(tmp_path / name))
+
+    def names(query, **options):
+        return {h["name"] for h in index.search(query, **options)}
+
+    assert names("tax") == {"return.txt", "ledger.py"}
+    assert names("tax", kind="text") == {"return.txt"}
+    assert names("tax", kind="code") == {"ledger.py"}
+    assert names("tax", kind="image") == set()
+    assert names("sunset", kind="image") == {"IMG_1.png"}
+    # Word matches are narrowed too: "sunset" is written in the source file.
+    assert names("sunset", words=True, semantic=False) == {"ledger.py"}
+    assert names("sunset", words=True, semantic=False, kind="text") == set()

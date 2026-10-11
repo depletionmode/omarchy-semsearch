@@ -23,6 +23,15 @@ Item {
   property bool waiting: false
   // Off: hits by meaning only. On: also the literal words and file paths.
   property bool wordMatch: false
+  // What the hits are narrowed to. Asking for pictures alone also makes the
+  // daemon generous with them: a gallery rather than only the stand-outs.
+  property string kind: "all"
+  readonly property var kinds: [
+    { id: "all", label: "All" },
+    { id: "text", label: "Documents" },
+    { id: "code", label: "Code" },
+    { id: "image", label: "Pictures" }
+  ]
 
   // Replies are matched to the latest request of their kind, so an answer to
   // a query the user has since typed past is dropped.
@@ -54,14 +63,18 @@ Item {
   property int gap: Style.spacing.panelGap
 
   function open(payloadJson) {
-    var initial = ""
+    // The payload may carry a query and a kind, so a key can be bound to,
+    // say, a picture search: '{"kind":"image"}'.
+    var payload = {}
     try {
-      initial = String(JSON.parse(payloadJson || "{}").query || "")
+      payload = JSON.parse(payloadJson || "{}") || {}
     } catch (e) {}
+    var known = root.kinds.some(function(k) { return k.id === payload.kind })
 
     root.opened = true
     sock.connected = true
-    root.setQuery(initial)
+    root.kind = known ? payload.kind : "all"
+    root.setQuery(String(payload.query || ""))
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -128,7 +141,21 @@ Item {
   }
 
   function search() {
-    root.searchId = root.send({ op: "search", q: root.query.trim(), words: root.wordMatch })
+    root.searchId = root.send({ op: "search", q: root.query.trim(), words: root.wordMatch, kind: root.kind })
+  }
+
+  function setKind(id) {
+    root.kind = id
+    root.setQuery(root.query)
+  }
+
+  function cycleKind() {
+    for (var i = 0; i < root.kinds.length; i++) {
+      if (root.kinds[i].id === root.kind) {
+        root.setKind(root.kinds[(i + 1) % root.kinds.length].id)
+        return
+      }
+    }
   }
 
   function toggleWordMatch() {
@@ -310,6 +337,9 @@ Item {
             else root.dismiss()
           } else if (Util.editsFilter(event, root.query)) {
             root.setQuery(Util.editedFilter(event, root.query))
+          } else if (event.key === Qt.Key_Backtab || (event.key === Qt.Key_Tab && (event.modifiers & Qt.ShiftModifier))) {
+            // Shift+Tab arrives as either, depending on the keyboard layout.
+            root.cycleKind()
           } else if (event.key === Qt.Key_Tab) {
             root.toggleWordMatch()
           } else if (event.key === Qt.Key_Up) {
@@ -363,7 +393,7 @@ Item {
             anchors.left: lens.right
             anchors.leftMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
-            width: Math.min(implicitWidth, parent.width - lens.width - modeChip.width - Style.space(40))
+            width: Math.min(implicitWidth, parent.width - lens.width - controls.width - Style.space(40))
             text: root.query || "Search by meaning…"
             color: root.foreground
             opacity: root.query ? 1 : 0.45
@@ -389,30 +419,44 @@ Item {
             }
           }
 
-          Rectangle {
-            id: modeChip
+          // What to look in, then how to match.
+          Row {
+            id: controls
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            width: modeLabel.implicitWidth + Style.space(20)
-            height: modeLabel.implicitHeight + Style.space(10)
-            radius: root.cornerRadius
-            color: root.wordMatch ? root.selectedBackground : Util.alpha(root.foreground, 0.06)
+            spacing: Style.space(4)
 
-            Text {
-              id: modeLabel
-              textFormat: Text.PlainText
-              anchors.centerIn: parent
-              text: root.wordMatch ? "Meaning + words" : "Meaning"
-              color: root.wordMatch ? root.accent : root.foreground
-              opacity: root.wordMatch ? 1 : 0.6
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
+            Repeater {
+              model: root.kinds.concat([{ id: "words", label: "" }])
 
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.toggleWordMatch()
+              Rectangle {
+                id: chip
+                required property var modelData
+                readonly property bool isMode: modelData.id === "words"
+                readonly property bool active: isMode ? root.wordMatch : root.kind === modelData.id
+
+                width: chipLabel.implicitWidth + Style.space(18)
+                height: chipLabel.implicitHeight + Style.space(10)
+                radius: root.cornerRadius
+                color: chip.active ? root.selectedBackground : Util.alpha(root.foreground, 0.06)
+
+                Text {
+                  id: chipLabel
+                  textFormat: Text.PlainText
+                  anchors.centerIn: parent
+                  text: chip.isMode ? (root.wordMatch ? "Meaning + words" : "Meaning") : chip.modelData.label
+                  color: chip.active ? root.accent : root.foreground
+                  opacity: chip.active ? 1 : 0.6
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: chip.isMode ? root.toggleWordMatch() : root.setKind(chip.modelData.id)
+                }
+              }
             }
           }
 
@@ -817,7 +861,7 @@ Item {
             textFormat: Text.PlainText
             anchors.right: parent.right
             anchors.bottom: parent.bottom
-            text: "⇥ Word matches " + (root.wordMatch ? "on" : "off") + "    ↵ Open    ⇧↵ Show in folder    ^C Copy path"
+            text: "⇧⇥ Kind    ⇥ Word matches " + (root.wordMatch ? "on" : "off") + "    ↵ Open    ⇧↵ Show in folder    ^C Copy path"
             color: root.foreground
             opacity: 0.5
             font.family: root.fontFamily

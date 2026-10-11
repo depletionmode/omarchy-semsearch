@@ -23,6 +23,10 @@ Then bind a key in `~/.config/hypr/bindings.lua`:
 o.bind("SUPER + F4", "Semantic search", "omarchy-shell shell toggle depmod.semsearch '{}'")
 ```
 
+A binding can open it already narrowed, for example to pictures:
+`omarchy-shell shell toggle depmod.semsearch '{"kind":"image"}'` (`text` and
+`code` work the same way).
+
 Indexing starts straight away and you can search while it runs. It covers
 your whole home directory, so the first run can take hours if you keep a lot
 of source code there; it is resumable, and `roots` narrows it (see below).
@@ -53,6 +57,7 @@ omarchy plugin remove depmod.semsearch
 | <kbd>Shift</kbd>+<kbd>Enter</kbd> | Show in the file manager |
 | <kbd>Ctrl</kbd>+<kbd>C</kbd> | Copy the path |
 | <kbd>Tab</kbd> | Also match literal words and file names (off by default) |
+| <kbd>Shift</kbd>+<kbd>Tab</kbd> | Narrow to documents, code or pictures |
 | <kbd>Esc</kbd> | Clear the query, then close |
 
 A search is by meaning only until you press <kbd>Tab</kbd>, which adds
@@ -61,8 +66,13 @@ it matched: it means something similar, it looks like what you described
 (pictures), it has your words, or its name matches. A PDF opens in the preview
 on the matching page with the passage highlighted.
 
-From a terminal: `semsearch status`, `semsearch rescan`, `semsearch <query>`
-and `semsearch -w <query>` to include word matches (in the plugin folder).
+Among everything, a picture is only listed when it clearly stands out for the
+query. Narrowed to pictures, the best thirty or so are listed, most relevant
+first, so expect the tail to be loose.
+
+From a terminal: `semsearch status`, `semsearch rescan`, `semsearch <query>`,
+with `-w` to include word matches and `-k text|code|image` to narrow (in the
+plugin folder).
 
 ## What is indexed
 
@@ -111,6 +121,7 @@ gpu_layers = 99            # 0 keeps the model off the GPU
 idle_unload_seconds = 300  # 0 keeps the model loaded
 min_similarity = 0.35
 min_image_similarity = 0.29
+min_gallery_similarity = 0.20  # when narrowed to pictures
 min_code_similarity = 0.35
 ```
 
