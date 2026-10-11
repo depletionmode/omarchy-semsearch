@@ -339,9 +339,9 @@ Item {
             root.setQuery(Util.editedFilter(event, root.query))
           } else if (event.key === Qt.Key_Backtab || (event.key === Qt.Key_Tab && (event.modifiers & Qt.ShiftModifier))) {
             // Shift+Tab arrives as either, depending on the keyboard layout.
-            root.cycleKind()
-          } else if (event.key === Qt.Key_Tab) {
             root.toggleWordMatch()
+          } else if (event.key === Qt.Key_Tab) {
+            root.cycleKind()
           } else if (event.key === Qt.Key_Up) {
             root.move(-1)
           } else if (event.key === Qt.Key_Down) {
@@ -861,7 +861,7 @@ Item {
             textFormat: Text.PlainText
             anchors.right: parent.right
             anchors.bottom: parent.bottom
-            text: "⇧⇥ Kind    ⇥ Word matches " + (root.wordMatch ? "on" : "off") + "    ↵ Open    ⇧↵ Show in folder    ^C Copy path"
+            text: "⇥ Kind    ⇧⇥ Word matches " + (root.wordMatch ? "on" : "off") + "    ↵ Open    ⇧↵ Show in folder    ^C Copy path"
             color: root.foreground
             opacity: 0.5
             font.family: root.fontFamily

@@ -56,11 +56,11 @@ omarchy plugin remove depmod.semsearch
 | <kbd>Enter</kbd> | Open: a PDF at the matching page, source at the matching line |
 | <kbd>Shift</kbd>+<kbd>Enter</kbd> | Show in the file manager |
 | <kbd>Ctrl</kbd>+<kbd>C</kbd> | Copy the path |
-| <kbd>Tab</kbd> | Also match literal words and file names (off by default) |
-| <kbd>Shift</kbd>+<kbd>Tab</kbd> | Narrow to documents, code or pictures |
+| <kbd>Tab</kbd> | Narrow to documents, code or pictures |
+| <kbd>Shift</kbd>+<kbd>Tab</kbd> | Also match literal words and file names (off by default) |
 | <kbd>Esc</kbd> | Clear the query, then close |
 
-A search is by meaning only until you press <kbd>Tab</kbd>, which adds
+A search is by meaning only until you press <kbd>Shift</kbd>+<kbd>Tab</kbd>, which adds
 passages that contain your words and files whose path does. Each hit says why
 it matched: it means something similar, it looks like what you described
 (pictures), it has your words, or its name matches. A PDF opens in the preview
