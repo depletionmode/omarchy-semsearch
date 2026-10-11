@@ -15,17 +15,17 @@ only packages Omarchy does not already ship.
 ```bash
 sudo pacman -S --needed uv poppler
 omarchy plugin add https://github.com/depletionmode/omarchy-semsearch.git --enable
-~/.config/omarchy/plugins/depmod.semsearch/install.sh
+~/.config/omarchy/plugins/depletionmode.semsearch/install.sh
 ```
 
 Then bind a key in `~/.config/hypr/bindings.lua`:
 
 ```lua
-o.bind("SUPER + F4", "Semantic search", "omarchy-shell shell toggle depmod.semsearch '{}'")
+o.bind("SUPER + F4", "Semantic search", "omarchy-shell shell toggle depletionmode.semsearch '{}'")
 ```
 
 A binding can open it already narrowed, for example to pictures:
-`omarchy-shell shell toggle depmod.semsearch '{"kind":"image"}'` (`text` and
+`omarchy-shell shell toggle depletionmode.semsearch '{"kind":"image"}'` (`text` and
 `code` work the same way).
 
 Indexing starts straight away and you can search while it runs. It covers
@@ -42,8 +42,8 @@ After `omarchy plugin update`, run `systemctl --user restart semsearch`.
 ## Remove
 
 ```bash
-~/.config/omarchy/plugins/depmod.semsearch/uninstall.sh --purge
-omarchy plugin remove depmod.semsearch
+~/.config/omarchy/plugins/depletionmode.semsearch/uninstall.sh --purge
+omarchy plugin remove depletionmode.semsearch
 ```
 
 `--purge` also deletes the index, model and page cache

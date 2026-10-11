@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "depmod.semsearch",
+  "id": "depletionmode.semsearch",
   "name": "Semantic search",
   "version": "1.0.0",
   "author": "David Kaplan",

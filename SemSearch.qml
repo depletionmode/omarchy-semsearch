@@ -85,7 +85,7 @@ Item {
   function dismiss() {
     root.close()
     if (root.shell && typeof root.shell.hide === "function")
-      root.shell.hide((root.manifest && root.manifest.id) || "depmod.semsearch")
+      root.shell.hide((root.manifest && root.manifest.id) || "depletionmode.semsearch")
   }
 
   function toggle() {
