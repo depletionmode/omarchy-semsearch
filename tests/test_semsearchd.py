@@ -370,13 +370,30 @@ def test_inside_a_repository_only_what_git_does_not_ignore(tmp_path):
     assert indexer.listing(str(repo / "build")) == []
 
 
-def test_watched_directories_are_the_ones_with_files_and_their_ancestors(tmp_path):
+def test_watched_directories_are_every_folder_a_file_could_appear_in(tmp_path):
     from inotify_simple import INotify
 
     for rel in ("a/b/c/deep.md", "a/other/skip.bin", "top.md"):
         write(tmp_path / rel)
     indexer = make_indexer(tmp_path)
     indexer.inotify = INotify()
-    indexer.watch_directories(indexer.listing(str(tmp_path)))
+    for rel in ("project/src/main.py", "project/assets/logo.svg", "project/build/out.js", ".cache/x/y.md"):
+        write(tmp_path / rel)
+    write(tmp_path / "project/.gitignore", "build/\n")
+    subprocess.run(["git", "init", "-q", str(tmp_path / "project")], check=True)
+    (tmp_path / "empty").mkdir()
+
+    indexer.watch_directories(indexer.scan(str(tmp_path))[1])
     watched = {os.path.relpath(d, tmp_path) for d in indexer.watches.values()}
-    assert watched == {".", "a", "a/b", "a/b/c"}
+    # Every folder a file could turn up in, indexable files in it yet or not;
+    # never a hidden one, nor one git ignores.
+    assert watched == {".", "a", "a/b", "a/b/c", "a/other", "empty", "project", "project/src", "project/assets"}
+
+
+def test_live_changes_are_taken_before_the_backlog(tmp_path):
+    indexer = make_indexer(tmp_path)
+    indexer.enqueue(["/backlog/1", "/backlog/2"])
+    indexer.enqueue(["/just/saved"], urgent=True)
+    indexer.enqueue(["/backlog/1"], urgent=True)  # already queued: not twice
+    assert indexer.total == 3
+    assert next(iter(indexer.urgent or indexer.pending)) == "/just/saved"

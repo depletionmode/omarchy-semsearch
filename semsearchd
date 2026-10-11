@@ -755,7 +755,8 @@ class Indexer:
         self.roots = [r for r in (os.path.expanduser(r).rstrip("/") for r in cfg["roots"]) if os.path.isdir(r)]
         self.exclude_names = {e for e in cfg["exclude"] if "/" not in e}
         self.exclude_paths = [e.strip("/") for e in cfg["exclude"] if "/" in e]
-        self.pending = {}  # insertion-ordered set
+        self.pending = {}  # insertion-ordered set: the backlog
+        self.urgent = {}  # the same for changes seen live, which go first
         self.cond = threading.Condition()
         self.total = 0
         self.done = 0
@@ -795,15 +796,26 @@ class Indexer:
         listing = self.git(directory, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
         return [os.path.join(directory, p) for p in listing.stdout.decode("utf-8", "replace").split("\0") if p]
 
-    def listing(self, top):
-        """Every indexable file below a directory."""
+    def scan(self, top):
+        """(files, directories) below a directory: every indexable file, and
+        every folder a new one could appear in. Outside a repository that is
+        each folder; inside one, each folder holding something git lists."""
+        candidates = []
+        directories = set()
+
+        def repository(directory):
+            for path in self.git_files(directory):
+                if not self.skipped(path):
+                    candidates.append(path)
+                    directories.add(os.path.dirname(path))
+
         if self.repository(top):
-            candidates = self.git_files(top)
+            repository(top)
         else:
-            candidates = []
             stack = [top]
             while stack:
                 directory = stack.pop()
+                directories.add(directory)
                 try:
                     entries = list(os.scandir(directory))
                 except OSError:
@@ -813,14 +825,16 @@ class Indexer:
                         continue
                     if entry.is_dir(follow_symlinks=False):
                         if os.path.exists(entry.path + "/.git"):
-                            candidates.extend(self.git_files(entry.path))
+                            repository(entry.path)
                         else:
                             stack.append(entry.path)
                     elif entry.is_file(follow_symlinks=False):
                         candidates.append(entry.path)
-        return [
-            p for p in candidates if self.index.kind_of(p) is not None and not self.skipped(p) and os.path.isfile(p)
-        ]
+        files = [p for p in candidates if self.index.kind_of(p) is not None and os.path.isfile(p)]
+        return files, directories
+
+    def listing(self, top):
+        return self.scan(top)[0]
 
     def wanted(self, path):
         """The same question for one path, as the watcher needs to ask it."""
@@ -833,11 +847,14 @@ class Indexer:
 
     # The queue.
 
-    def enqueue(self, paths):
+    def enqueue(self, paths, urgent=False):
+        """Queue paths. A file just saved should not wait behind a first index
+        of everything, so the watcher's paths are taken before the backlog."""
+        queue = self.urgent if urgent else self.pending
         with self.cond:
             for p in paths:
-                if p not in self.pending:
-                    self.pending[p] = True
+                if p not in self.pending and p not in self.urgent:
+                    queue[p] = True
                     self.total += 1
             self.cond.notify()
 
@@ -845,11 +862,12 @@ class Indexer:
         limits = {CODE: self.cfg["max_code_kb"] << 10}
         while True:
             with self.cond:
-                while not self.pending:
+                while not (self.pending or self.urgent):
                     self.total = self.done = 0
                     self.cond.wait()
-                path = next(iter(self.pending))
-                del self.pending[path]
+                queue = self.urgent or self.pending
+                path = next(iter(queue))
+                del queue[path]
             try:
                 limit = limits.get(self.index.kind_of(path), self.cfg["max_file_mb"] << 20)
                 if os.path.isfile(path) and os.path.getsize(path) <= limit and self.wanted(path):
@@ -867,7 +885,9 @@ class Indexer:
         on_disk = set()
         changed = []
         for root in self.roots:
-            for path in self.listing(root):
+            files, directories = self.scan(root)
+            self.watch_directories(directories)
+            for path in files:
                 on_disk.add(path)
                 try:
                     st = os.stat(path)
@@ -876,15 +896,15 @@ class Indexer:
                 if known.get(path) != (st.st_mtime, st.st_size):
                     changed.append(path)
         self.enqueue(changed + [p for p in known if p not in on_disk])
-        self.watch_directories(on_disk)
         log("reconcile: %d to index, %d known, %d directories watched" % (len(changed), len(known), len(self.watches)))
 
-    # Watching. One inotify watch per directory that holds an indexed file,
-    # and per ancestor up to the root so that a new folder is noticed. A
-    # recursive watch would also cover every node_modules and .git, which on a
-    # home directory is most of the watches a user is allowed.
+    # Watching. inotify is not recursive: one watch sees one directory. So
+    # there is a watch on every directory a file could turn up in (see scan),
+    # and on each ancestor up to the root so that a new folder is noticed.
+    # Watching everything instead would also cover every node_modules and
+    # .git, which on a home directory is most of the watches a user is allowed.
 
-    def watch_directories(self, files):
+    def watch_directories(self, directories):
         if self.inotify is None:
             return
         from inotify_simple import flags
@@ -892,8 +912,7 @@ class Indexer:
         mask = flags.CLOSE_WRITE | flags.CREATE | flags.MOVED_TO | flags.MOVED_FROM | flags.DELETE | flags.ONLYDIR
         watched = set(self.watches.values())
         wanted = set()
-        for path in files:
-            directory = os.path.dirname(path)
+        for directory in directories:
             while directory not in wanted and any((directory + "/").startswith(r + "/") for r in self.roots):
                 wanted.add(directory)
                 directory = os.path.dirname(directory)
@@ -927,15 +946,20 @@ class Indexer:
                     if self.index.kind_of(path) is not None:
                         paths.append(path)
                 elif event.mask & (flags.CREATE | flags.MOVED_TO):
-                    if not self.skipped(path):
-                        new = self.listing(path)
-                        self.watch_directories(new)
+                    # A new folder: watch it and what is in it, unless git
+                    # ignores it. It is watched even while empty, since files
+                    # usually arrive after the folder does.
+                    ignored = self.repository(directory) and self.git(directory, "check-ignore", "-q", path).returncode == 0
+                    if not self.skipped(path) and not ignored:
+                        new, directories = self.scan(path)
+                        inside = (d for d, _, _ in os.walk(path) if not self.skipped(d))
+                        self.watch_directories(directories | set(inside))
                         paths.extend(new)
                 else:
                     # A folder moved away or deleted takes its files with it.
                     known = known or self.index.known_files()
                     paths.extend(p for p in known if p.startswith(path + "/"))
-            self.enqueue(paths)
+            self.enqueue(paths, urgent=True)
 
     def start(self):
         for target in (self.work, self.watch):

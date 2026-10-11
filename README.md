@@ -86,8 +86,11 @@ Not indexed:
   pictures under 64 px.
 
 Identical text is embedded once, so copies and extra worktrees cost little.
-Changes are picked up live with inotify (one watch per folder that holds an
-indexed file, not a recursive watch) and re-checked when the daemon starts.
+Changes are picked up live with inotify and take priority over a first index
+still in progress. inotify is not recursive, so there is one watch per folder
+a file could appear in: every folder outside repositories, and inside them
+every folder git does not ignore. New folders are watched as they appear.
+Everything is re-checked when the daemon starts.
 
 ## Configuration
 
