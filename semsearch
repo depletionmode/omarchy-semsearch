@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Command-line client for semsearchd: semsearch status | rescan | <query>"""
+import json
+import os
+import socket
+import sys
+
+arg = " ".join(sys.argv[1:]) or "status"
+req = {"id": 1, "op": arg} if arg in ("status", "rescan") else {"id": 1, "op": "search", "q": arg}
+s = socket.socket(socket.AF_UNIX)
+s.connect(os.environ["XDG_RUNTIME_DIR"] + "/semsearch.sock")
+s.sendall((json.dumps(req) + "\n").encode())
+resp = json.loads(s.makefile().readline())
+for hit in resp.get("hits", []):
+    page = " p.%d" % hit["page"] if hit["page"] else ""
+    print("%-7s %s/%s%s" % (hit["why"], hit["dir"], hit["name"], page))
+print(resp.get("error") or resp["status"], file=sys.stderr)

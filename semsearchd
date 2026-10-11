@@ -1,0 +1,761 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["numpy>=1.26", "watchfiles>=0.21", "pillow>=10"]
+# ///
+"""semsearchd: local semantic search for the Semantic search Omarchy plugin.
+
+Indexes documents (as passages) and images, embeds them with EmbeddingGemma 2
+through a llama-server it starts on demand, and answers JSON-lines requests on
+a unix socket. Ranking fuses SQLite FTS5 (the literal words, in the text or the
+file path) with cosine similarity (the meaning, or what a picture shows).
+"""
+
+import base64
+import hashlib
+import html
+import io
+import json
+import os
+import re
+import signal
+import socket
+import socketserver
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+import urllib.error
+import urllib.request
+import zipfile
+from pathlib import Path
+
+import numpy as np
+
+HOME = str(Path.home())
+DATA = Path(os.environ.get("XDG_DATA_HOME", HOME + "/.local/share")) / "semsearch"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", HOME + "/.cache")) / "semsearch"
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME + "/.config")) / "semsearch" / "config.toml"
+SOCKET = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "semsearch.sock"
+
+DEFAULTS = {
+    "roots": ["~/Documents", "~/Downloads", "~/Desktop", "~/Pictures"],
+    "exclude": ["node_modules", "__pycache__", "venv", "site-packages"],
+    "extensions": ["pdf", "md", "txt", "org", "rst", "docx", "odt"],
+    "image_extensions": ["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"],
+    "max_file_mb": 100,
+    "max_pages": 500,
+    "model": str(DATA / "models" / "embeddinggemma-2-Q8_0.gguf"),
+    "mmproj": str(DATA / "models" / "mmproj-embeddinggemma-2-Q8_0.gguf"),
+    "llama_server": str(DATA / "llama" / "llama-server"),
+    "gpu_layers": 99,
+    # Seconds without a query or indexing before the model is unloaded. 0 keeps it.
+    "idle_unload_seconds": 300,
+    # Similarity below which a passage is not a "similar meaning" hit, measured
+    # after the corpus mean is subtracted (see Index._vectors).
+    "min_similarity": 0.35,
+    # The same for a picture against a text query, which scores lower.
+    "min_image_similarity": 0.29,
+}
+
+# Prompts from the google/embeddinggemma-2 model card.
+QUERY_PROMPT = "task: search result | query: "
+DOC_PROMPT = "title: {title} | text: {text}"
+
+STOPWORDS = set(
+    "a about all also an and any are as at be been but by can did do does for from had has "
+    "have he her his how if in into is it its me my no not of on or our she so some than "
+    "that the their them then there these they this to up us was we were what when where "
+    "which who why will with would you your".split()
+)
+
+
+def log(*args):
+    print(*args, file=sys.stderr, flush=True)
+
+
+# --- Text -------------------------------------------------------------------
+
+
+def windows(n, size=180, overlap=30):
+    """Word spans (start, end) of overlapping passages covering n words."""
+    spans = []
+    start = 0
+    while start < n:
+        end = min(n, start + size)
+        if n - end <= overlap:
+            end = n  # a tail the next window would only repeat
+        spans.append((start, end))
+        if end == n:
+            break
+        start = end - overlap
+    return spans
+
+
+def query_terms(query):
+    return [t for t in re.findall(r"\w+", query.lower()) if len(t) >= 2 and t not in STOPWORDS]
+
+
+def is_match(word, terms):
+    w = word.lower()
+    return any(w.startswith(t) or (len(w) >= 4 and t.startswith(w)) for t in terms)
+
+
+def snippet(text, terms, width=170):
+    """HTML-escaped excerpt around the first matching word, matches in <b>."""
+    words = text.split()
+    parts = [re.match(r"^(\W*)(.*?)(\W*)$", w, re.S).groups() for w in words]
+    hit = next((i for i, p in enumerate(parts) if terms and is_match(p[1], terms)), 0)
+
+    start = end = hit
+    used = 0
+    # A third of the room before the match, the rest after it.
+    while start > 0 and used + len(words[start - 1]) < width // 3:
+        start -= 1
+        used += len(words[start]) + 1
+    while end < len(words) and used + len(words[end]) < width:
+        used += len(words[end]) + 1
+        end += 1
+
+    out = []
+    for pre, core, post in parts[start:end]:
+        core_html = html.escape(core)
+        if terms and core and is_match(core, terms):
+            core_html = "<b>" + core_html + "</b>"
+        out.append(html.escape(pre) + core_html + html.escape(post))
+    return ("…" if start > 0 else "") + " ".join(out) + ("…" if end < len(words) else "")
+
+
+# --- Extraction -------------------------------------------------------------
+
+BBOX_PAGE = re.compile(r'<page width="([\d.]+)" height="([\d.]+)">(.*?)</page>', re.S)
+BBOX_WORD = re.compile(
+    r'<word xMin="([-\d.]+)" yMin="([-\d.]+)" xMax="([-\d.]+)" yMax="([-\d.]+)">(.*?)</word>', re.S
+)
+
+
+def parse_bbox(xhtml):
+    """pdftotext -bbox output -> [{size: (w, h), words: [(text, x0, y0, x1, y1)]}]."""
+    pages = []
+    for width, height, body in BBOX_PAGE.findall(xhtml):
+        words = [
+            (html.unescape(text), float(x0), float(y0), float(x1), float(y1))
+            for x0, y0, x1, y1, text in BBOX_WORD.findall(body)
+        ]
+        pages.append({"size": (float(width), float(height)), "words": words})
+    return pages
+
+
+def pdf_pages(path, first=None, last=None):
+    cmd = ["pdftotext", "-bbox"]
+    if first:
+        cmd += ["-f", str(first), "-l", str(last or first)]
+    out = subprocess.run(cmd + [path, "-"], capture_output=True, timeout=180).stdout
+    return parse_bbox(out.decode("utf-8", "replace"))
+
+
+def line_rects(words, size):
+    """Merge consecutive words on one line into rects, as fractions of the page."""
+    width, height = size
+    rects = []
+    for _, x0, y0, x1, y1 in words:
+        if rects and abs(rects[-1][1] - y0) < 2 and x0 >= rects[-1][0]:
+            rects[-1][2] = max(rects[-1][2], x1)
+            rects[-1][3] = max(rects[-1][3], y1)
+        else:
+            rects.append([x0, y0, x1, y1])
+    return [(x0 / width, y0 / height, (x1 - x0) / width, (y1 - y0) / height) for x0, y0, x1, y1 in rects]
+
+
+def zipped_xml_words(path, member):
+    with zipfile.ZipFile(path) as z:
+        xml = z.read(member).decode("utf-8", "replace")
+    return html.unescape(re.sub(r"<[^>]+>", " ", xml)).split()
+
+
+def extract(path, max_pages):
+    """-> [(page_number, [word, ...])]. Page 0 means the format has no pages."""
+    ext = path.rsplit(".", 1)[-1].lower()
+    if ext == "pdf":
+        return [(i + 1, [w[0] for w in p["words"]]) for i, p in enumerate(pdf_pages(path, 1, max_pages))]
+    if ext == "docx":
+        return [(0, zipped_xml_words(path, "word/document.xml"))]
+    if ext == "odt":
+        return [(0, zipped_xml_words(path, "content.xml"))]
+    with open(path, "rb") as f:
+        return [(0, f.read(4 << 20).decode("utf-8", "replace").split())]
+
+
+def image_size(path):
+    from PIL import Image
+
+    with Image.open(path) as im:
+        return im.size
+
+
+def image_input(path):
+    """An image as a /v1/embeddings input item, downscaled: the vision encoder
+    resamples to its own resolution anyway, and a 24 MP photo is slow to ship."""
+    from PIL import Image
+
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        im.thumbnail((768, 768))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=88)
+    url = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+    return {"content": [{"type": "image_url", "image_url": {"url": url}}]}
+
+
+# --- Embedding --------------------------------------------------------------
+
+
+class LlamaEmbedder:
+    """EmbeddingGemma through a llama-server child, started lazily, stopped when idle.
+
+    With vision=False only the text model is loaded, which is all a query or a
+    document needs; the vision projector is twice its size."""
+
+    def __init__(self, cfg, vision=False):
+        self.cfg = cfg
+        self.vision = vision
+        self.lock = threading.Lock()
+        self.proc = None
+        self.port = 0
+        self.active = 0
+        self.last_used = 0.0
+
+    def loaded(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def _start(self):
+        server = self.cfg["llama_server"]
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            self.port = s.getsockname()[1]
+        # Two slots so a query never queues behind an indexing batch; the
+        # context is split between them, 2048 tokens each.
+        cmd = [server, "-m", self.cfg["model"], "--embedding", "--host", "127.0.0.1", "--port", str(self.port),
+               "-ngl", str(self.cfg["gpu_layers"]), "-c", "4096", "-b", "2048", "-ub", "2048", "--parallel", "2"]
+        if self.vision:
+            cmd += ["--mmproj", self.cfg["mmproj"]]
+        env = dict(os.environ, LD_LIBRARY_PATH=os.path.dirname(server))
+        self.proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError("llama-server exited with %s" % self.proc.returncode)
+            try:
+                urllib.request.urlopen("http://127.0.0.1:%d/health" % self.port, timeout=1)
+                log("vision model loaded" if self.vision else "text model loaded")
+                return
+            except OSError:
+                time.sleep(0.1)
+        raise RuntimeError("llama-server did not become ready")
+
+    def _post(self, inputs):
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/v1/embeddings" % self.port,
+            json.dumps({"input": inputs}).encode(),
+            {"Content-Type": "application/json"},
+        )
+        data = json.load(urllib.request.urlopen(req, timeout=120))["data"]
+        return [d["embedding"] for d in sorted(data, key=lambda d: d["index"])]
+
+    def _one(self, item):
+        # Dense tables can tokenize to more than a slot holds; halve until it fits.
+        for _ in range(4):
+            try:
+                return self._post([item])[0]
+            except urllib.error.HTTPError:
+                if not isinstance(item, str):
+                    break
+                item = item[: len(item) // 2]
+        raise RuntimeError("input could not be embedded")
+
+    def embed(self, inputs):
+        """Unit vectors for a list of strings and/or image_input() items."""
+        with self.lock:
+            if not self.loaded():
+                self._start()
+            self.active += 1
+        try:
+            try:
+                vectors = self._post(inputs)
+            except urllib.error.HTTPError:
+                vectors = [self._one(item) for item in inputs]
+        finally:
+            with self.lock:
+                self.active -= 1
+                self.last_used = time.monotonic()
+        m = np.asarray(vectors, dtype=np.float32)
+        return m / np.linalg.norm(m, axis=1, keepdims=True)
+
+    def unload_if_idle(self):
+        idle = self.cfg["idle_unload_seconds"]
+        with self.lock:
+            if idle and self.loaded() and not self.active and time.monotonic() - self.last_used > idle:
+                self._stop()
+                log("%s model unloaded after %ds idle" % ("vision" if self.vision else "text", idle))
+
+    def _stop(self):
+        if self.proc:
+            self.proc.terminate()
+            try:
+                self.proc.wait(10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+            self.proc = None
+
+    def stop(self):
+        with self.lock:
+            self._stop()
+
+
+# --- Index ------------------------------------------------------------------
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, mtime REAL, size INTEGER, pages INTEGER);
+CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY, file_id INTEGER, image INTEGER, page INTEGER,
+                                  w0 INTEGER, w1 INTEGER, text TEXT, vec BLOB);
+CREATE INDEX IF NOT EXISTS chunks_file ON chunks(file_id);
+CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(title, body, tokenize='porter unicode61');
+"""
+
+
+class Index:
+    def __init__(self, db, embedder, image_embedder=None, cfg=DEFAULTS):
+        self.db = db
+        self.embedder = embedder
+        self.image_embedder = image_embedder or embedder
+        self.cfg = cfg
+        self.lock = threading.RLock()
+        self.image_extensions = set(cfg["image_extensions"])
+        self.ids = np.zeros(0, dtype=np.int64)
+        self.images = np.zeros(0, dtype=bool)
+        self.matrix = np.zeros((0, 1), dtype=np.float32)
+        self.means = {}
+        self.stale = True
+        with self.lock, self.db:
+            self.db.executescript(SCHEMA)
+
+    def reset_if_model_changed(self, model):
+        with self.lock, self.db:
+            row = self.db.execute("SELECT value FROM meta WHERE key='model'").fetchone()
+            if row and row[0] != model:
+                log("model changed, rebuilding the index")
+                for table in ("files", "chunks", "fts"):
+                    self.db.execute("DELETE FROM " + table)
+                self.stale = True
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES('model', ?)", (model,))
+
+    def known_files(self):
+        with self.lock:
+            return {p: (m, s) for p, m, s in self.db.execute("SELECT path, mtime, size FROM files")}
+
+    def stats(self):
+        with self.lock:
+            files = self.db.execute("SELECT count(*) FROM files").fetchone()[0]
+            chunks = self.db.execute("SELECT count(*) FROM chunks").fetchone()[0]
+        return {"files": files, "chunks": chunks}
+
+    def index_file(self, path):
+        st = os.stat(path)
+        with self.lock:
+            row = self.db.execute("SELECT mtime, size FROM files WHERE path=?", (path,)).fetchone()
+        if row == (st.st_mtime, st.st_size):
+            return
+
+        title = os.path.basename(path).rsplit(".", 1)[0]
+        image = path.rsplit(".", 1)[-1].lower() in self.image_extensions
+        pages = []
+        passages = []  # (page, w0, w1, text)
+        vectors = []
+        if image:
+            # One vector for the picture itself. Icons and spacers are noise.
+            if min(image_size(path)) >= 64:
+                passages = [(0, 0, 0, "")]
+                vectors = list(self.image_embedder.embed([image_input(path)]))
+        else:
+            pages = extract(path, self.cfg["max_pages"])
+            for page, words in pages:
+                for w0, w1 in windows(len(words)):
+                    passages.append((page, w0, w1, " ".join(words[w0:w1])))
+            for i in range(0, len(passages), 8):
+                batch = [DOC_PROMPT.format(title=title, text=p[3]) for p in passages[i : i + 8]]
+                vectors.extend(self.embedder.embed(batch))
+
+        with self.lock, self.db:
+            self._delete(path)
+            file_id = self.db.execute(
+                "INSERT INTO files(path, mtime, size, pages) VALUES(?,?,?,?)",
+                (path, st.st_mtime, st.st_size, len(pages) if pages and pages[0][0] else 0),
+            ).lastrowid
+            for n, ((page, w0, w1, text), vec) in enumerate(zip(passages, vectors)):
+                chunk_id = self.db.execute(
+                    "INSERT INTO chunks(file_id, image, page, w0, w1, text, vec) VALUES(?,?,?,?,?,?,?)",
+                    (file_id, image, page, w0, w1, text, vec.astype(np.float32).tobytes()),
+                ).lastrowid
+                # The path is searchable too, on the first passage only so a
+                # folder name matches each document in it once.
+                self.db.execute(
+                    "INSERT INTO fts(rowid, title, body) VALUES(?,?,?)",
+                    (chunk_id, path.removeprefix(HOME) if n == 0 else "", text),
+                )
+            self.stale = True
+
+    def _delete(self, path):
+        row = self.db.execute("SELECT id FROM files WHERE path=?", (path,)).fetchone()
+        if not row:
+            return
+        self.db.execute("DELETE FROM fts WHERE rowid IN (SELECT id FROM chunks WHERE file_id=?)", row)
+        self.db.execute("DELETE FROM chunks WHERE file_id=?", row)
+        self.db.execute("DELETE FROM files WHERE id=?", row)
+        self.stale = True
+
+    def remove_file(self, path):
+        with self.lock, self.db:
+            self._delete(path)
+
+    def _vectors(self):
+        with self.lock:
+            if self.stale:
+                rows = self.db.execute("SELECT id, image, vec FROM chunks").fetchall()
+                self.ids = np.array([r[0] for r in rows], dtype=np.int64)
+                self.images = np.array([r[1] for r in rows], dtype=bool)
+                matrix = np.frombuffer(b"".join(r[2] for r in rows), dtype=np.float32).reshape(len(rows), -1).copy()
+                # Every embedding shares a large common component (the mean
+                # vector has norm ~0.8), which leaves unrelated passages at a
+                # cosine of ~0.55 and real matches barely above them. Taking
+                # the mean out, per kind, is what makes a threshold meaningful.
+                # With only a few rows the mean is just those rows, so it stays.
+                self.means = {}
+                for kind in (False, True):
+                    where = self.images == kind
+                    mean = matrix[where].mean(0) if where.sum() >= 20 else np.zeros(matrix.shape[1], np.float32)
+                    self.means[kind] = mean
+                    centred = matrix[where] - mean
+                    matrix[where] = centred / np.maximum(np.linalg.norm(centred, axis=1, keepdims=True), 1e-9)
+                self.matrix = matrix
+                self.stale = False
+            return self.ids, self.images, self.matrix, self.means
+
+    def _word_ranks(self, terms, joiner):
+        """{chunk id: rank} of FTS matches, as typed or failing that with the
+        last term as a prefix, so results follow a word still being typed."""
+        if not terms:
+            return {}
+        for prefix in ("", "*"):
+            match = joiner.join('"%s"' % t for t in terms) + prefix
+            with self.lock:
+                rows = self.db.execute(
+                    "SELECT rowid FROM fts WHERE fts MATCH ? ORDER BY bm25(fts, 4.0, 1.0) LIMIT 60", (match,)
+                ).fetchall()
+            if rows:
+                break
+        return {r[0]: rank for rank, r in enumerate(rows)}
+
+    def search(self, query, limit=30, semantic=True):
+        """semantic=False answers from the words alone, without the model."""
+        terms = query_terms(query)
+        ids, images, matrix, means = self._vectors()
+
+        # Passages and pictures are ranked apart: a picture scores lower
+        # against a text query than a passage does, so one list would bury them.
+        by_meaning, by_looks = {}, {}
+        if semantic and len(ids):
+            vector = self.embedder.embed([QUERY_PROMPT + query])[0]
+            for ranks, kind, floor, window in (
+                (by_meaning, False, self.cfg["min_similarity"], 0.12),
+                (by_looks, True, self.cfg["min_image_similarity"], 0.05),
+            ):
+                where = np.flatnonzero(images == kind)
+                if not len(where):
+                    continue
+                centred = vector - means[kind]
+                sims = matrix[where] @ (centred / np.linalg.norm(centred))
+                order = np.argsort(-sims)[:60]
+                # There is always a nearest neighbour; only ones near the
+                # best, and above the floor, count as hits.
+                floor = max(floor, sims[order[0]] - window)
+                ranks.update((int(ids[where[i]]), rank) for rank, i in enumerate(order) if sims[i] >= floor)
+
+        by_words = self._word_ranks(terms, " AND ")
+        if semantic and not (by_words or by_meaning or by_looks):
+            # Nothing has all the words and nothing means the same: passages
+            # with any of the words are better than an empty list. Only then,
+            # because one common word of a long question matches almost anything.
+            by_words = self._word_ranks(terms, " OR ")
+
+        # Reciprocal rank fusion of the lists. Pictures count for less: their
+        # similarity to a text query separates good from bad less sharply.
+        scores = {}
+        for ranks, weight in ((by_meaning, 1.0), (by_looks, 0.6), (by_words, 1.0)):
+            for chunk_id, rank in ranks.items():
+                scores[chunk_id] = scores.get(chunk_id, 0.0) + weight / (60 + rank)
+
+        hits = []
+        seen_files = set()
+        for chunk_id in sorted(scores, key=scores.get, reverse=True):
+            with self.lock:
+                row = self.db.execute(
+                    "SELECT f.id, f.path, f.mtime, f.size, f.pages, c.page, c.text, c.image "
+                    "FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.id=?", (chunk_id,)
+                ).fetchone()
+            if not row or row[0] in seen_files:
+                continue  # one row per document: its best passage
+            seen_files.add(row[0])
+            _, path, mtime, size, pages, page, text, image = row
+            directory, name = os.path.split(path)
+            excerpt = snippet(text, terms)
+            if chunk_id not in by_words:
+                why = "looks" if image else "meaning"
+            else:
+                why = "words" if "<b>" in excerpt else "name"
+            hits.append({
+                "chunk": chunk_id,
+                "path": path,
+                "name": name,
+                "dir": "~" + directory[len(HOME):] if directory.startswith(HOME) else directory,
+                "ext": name.rsplit(".", 1)[-1].lower() if "." in name else "",
+                "page": page,
+                "pages": pages,
+                "mtime": int(mtime),
+                "size": size,
+                "image": bool(image),
+                "why": why,
+                "snippet": excerpt,
+            })
+            if len(hits) >= limit:
+                break
+        return hits
+
+    def preview(self, chunk_id, query):
+        """What the preview pane shows for one hit: a page image with highlight
+        rects for a PDF, the picture for an image, a longer excerpt otherwise."""
+        terms = query_terms(query)
+        with self.lock:
+            row = self.db.execute(
+                "SELECT f.path, f.mtime, c.page, c.w0, c.w1, c.text, c.image FROM chunks c "
+                "JOIN files f ON f.id = c.file_id "
+                "WHERE c.id=?", (chunk_id,)
+            ).fetchone()
+        if not row:
+            return {}
+        path, mtime, page, w0, w1, text, image = row
+        if image:
+            width, height = image_size(path)
+            return {"image": path, "aspect": height / width, "passage": [], "terms": []}
+        if not page:
+            return {"text": snippet(text, terms, width=1400)}
+
+        key = hashlib.sha1(("%s|%s|%d" % (path, mtime, page)).encode()).hexdigest()[:24]
+        render = CACHE / "pages" / (key + ".png")
+        if not render.exists():
+            render.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["pdftoppm", "-f", str(page), "-l", str(page), "-r", "140", "-png", "-singlefile", path,
+                 str(render.with_suffix(""))],
+                capture_output=True, timeout=60,
+            )
+        pages = pdf_pages(path, page)
+        if not pages or not render.exists():
+            return {"text": snippet(text, terms, width=1400)}
+        size, words = pages[0]["size"], pages[0]["words"]
+        matches = [w for w in words if terms and is_match(re.sub(r"^\W+|\W+$", "", w[0]), terms)]
+        return {
+            "image": str(render),
+            "aspect": size[1] / size[0],
+            "passage": line_rects(words[w0:w1], size),
+            "terms": [r for w in matches for r in line_rects([w], size)],
+        }
+
+
+# --- Keeping the index current ---------------------------------------------
+
+
+class Indexer:
+    """Queue of paths to (re)index or forget, fed by a startup reconcile and by
+    inotify, drained by one worker thread."""
+
+    def __init__(self, index, cfg):
+        self.index = index
+        self.cfg = cfg
+        self.roots = [r for r in (os.path.expanduser(r) for r in cfg["roots"]) if os.path.isdir(r)]
+        self.extensions = set(cfg["extensions"]) | set(cfg["image_extensions"])
+        self.exclude = set(cfg["exclude"])
+        self.pending = {}  # insertion-ordered set
+        self.cond = threading.Condition()
+        self.total = 0
+        self.done = 0
+
+    def wanted(self, path):
+        if path.rsplit(".", 1)[-1].lower() not in self.extensions:
+            return False
+        root = next((r for r in self.roots if path.startswith(r + "/")), None)
+        if not root:
+            return False
+        parts = path[len(root) + 1 :].split("/")
+        return not any(p.startswith(".") or p in self.exclude for p in parts)
+
+    def walk(self, top):
+        for directory, dirs, names in os.walk(top):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in self.exclude]
+            for name in names:
+                path = os.path.join(directory, name)
+                if self.wanted(path):
+                    yield path
+
+    def enqueue(self, paths):
+        with self.cond:
+            for p in paths:
+                if p not in self.pending:
+                    self.pending[p] = True
+                    self.total += 1
+            self.cond.notify()
+
+    def reconcile(self):
+        """Catch up with whatever changed while nothing was watching."""
+        known = self.index.known_files()
+        on_disk = set()
+        changed = []
+        for root in self.roots:
+            for path in self.walk(root):
+                on_disk.add(path)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                if known.get(path) != (st.st_mtime, st.st_size):
+                    changed.append(path)
+        self.enqueue(changed + [p for p in known if p not in on_disk])
+        log("reconcile: %d to index, %d known" % (len(changed), len(known)))
+
+    def watch(self):
+        from watchfiles import watch
+
+        for changes in watch(*self.roots):
+            known = self.index.known_files()
+            paths = []
+            for _, path in changes:
+                if os.path.isdir(path):
+                    paths.extend(self.walk(path))  # a folder moved in
+                elif self.wanted(path) or path in known:
+                    paths.append(path)
+                # A folder moved or deleted takes its documents with it.
+                paths.extend(p for p in known if p.startswith(path + "/"))
+            self.enqueue(paths)
+
+    def work(self):
+        limit = self.cfg["max_file_mb"] << 20
+        while True:
+            with self.cond:
+                while not self.pending:
+                    self.total = self.done = 0
+                    self.cond.wait()
+                path = next(iter(self.pending))
+                del self.pending[path]
+            try:
+                if os.path.isfile(path) and self.wanted(path) and os.path.getsize(path) <= limit:
+                    self.index.index_file(path)
+                else:
+                    self.index.remove_file(path)
+            except Exception as e:
+                log("skipped %s: %s" % (path, e))
+            self.done += 1
+
+    def start(self):
+        for target in (self.work, self.reconcile, self.watch):
+            threading.Thread(target=target, daemon=True).start()
+
+
+# --- Socket -----------------------------------------------------------------
+
+
+class Handler(socketserver.StreamRequestHandler):
+    def handle(self):
+        for line in self.rfile:
+            req = {}
+            try:
+                req = json.loads(line)
+                if req.get("op") == "search" and not self.server.embedder.loaded():
+                    # The words need no model: answer with those now, and
+                    # again in full once it has loaded.
+                    self.reply(req, {"hits": self.server.index.search(req["q"], semantic=False), "partial": True})
+                resp = self.server.dispatch(req)
+            except Exception as e:
+                resp = {"error": str(e)}
+            self.reply(req, resp)
+
+    def reply(self, req, resp):
+        resp.update(id=req.get("id"), op=req.get("op"), status=self.server.status())
+        self.wfile.write((json.dumps(resp) + "\n").encode())
+        self.wfile.flush()
+
+
+class Server(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+
+    def __init__(self, index, indexer, embedder):
+        self.index, self.indexer, self.embedder = index, indexer, embedder
+        super().__init__(str(SOCKET), Handler)
+
+    def status(self):
+        s = self.index.stats()
+        s.update(done=self.indexer.done, total=self.indexer.total, loaded=self.embedder.loaded())
+        return s
+
+    def dispatch(self, req):
+        op = req.get("op")
+        if op == "search":
+            return {"hits": self.index.search(req["q"])}
+        if op == "preview":
+            return {"preview": self.index.preview(req["chunk"], req.get("q", ""))}
+        if op == "warm":
+            # Load the model while the user is still typing their first query.
+            threading.Thread(target=self.embedder.embed, args=(["warm"],), daemon=True).start()
+        elif op == "rescan":
+            threading.Thread(target=self.indexer.reconcile, daemon=True).start()
+        return {}
+
+
+def main():
+    cfg = dict(DEFAULTS)
+    if CONFIG.exists():
+        cfg.update(tomllib.loads(CONFIG.read_text()))
+
+    DATA.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(DATA / "index.db", check_same_thread=False)
+    db.execute("PRAGMA journal_mode=WAL")
+
+    embedder = LlamaEmbedder(cfg)
+    image_embedder = LlamaEmbedder(cfg, vision=True)
+    index = Index(db, embedder, image_embedder, cfg)
+    index.reset_if_model_changed(os.path.basename(cfg["model"]))
+    indexer = Indexer(index, cfg)
+
+    def reap():
+        while True:
+            time.sleep(30)
+            embedder.unload_if_idle()
+            image_embedder.unload_if_idle()
+
+    os.umask(0o077)
+    SOCKET.unlink(missing_ok=True)
+    server = Server(index, indexer, embedder)
+    indexer.start()
+    threading.Thread(target=reap, daemon=True).start()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        server.serve_forever()
+    finally:
+        embedder.stop()
+        image_embedder.stop()
+        SOCKET.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    main()
