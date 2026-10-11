@@ -31,6 +31,7 @@ Item {
   property int previewId: 0
 
   readonly property string socketPath: Quickshell.env("XDG_RUNTIME_DIR") + "/semsearch.sock"
+  readonly property string openScript: decodeURIComponent(Qt.resolvedUrl("open-hit").toString().replace(/^file:\/\//, ""))
   readonly property int minQueryLength: 2
 
   // Shares the [menu] surface tokens, like the other summoned overlays.
@@ -153,7 +154,8 @@ Item {
   // Paths go through execArgv so nothing in a filename is read by a shell.
   function openHit() {
     if (!root.hit) return
-    Util.execArgv(["setsid", "uwsm-app", "--", "xdg-open", root.hit.path])
+    // Opens a PDF at the matching page and source at the matching line.
+    Util.execArgv(["setsid", "uwsm-app", "--", root.openScript, root.hit.path, String(root.hit.page), String(root.hit.line)])
     root.dismiss()
   }
 
@@ -176,6 +178,7 @@ Item {
   // --- Presentation ---------------------------------------------------------
 
   function glyph(row) {
+    if (row.line) return ""
     if (row.image) return ""
     if (row.ext === "pdf") return ""
     if (row.ext === "docx" || row.ext === "odt") return ""
@@ -498,8 +501,8 @@ Item {
                 anchors.right: parent.right
                 anchors.rightMargin: Style.space(10)
                 anchors.baseline: nameText.baseline
-                visible: row.modelData.page > 0
-                text: "p. " + row.modelData.page
+                visible: row.modelData.page > 0 || row.modelData.line > 0
+                text: row.modelData.page > 0 ? "p. " + row.modelData.page : "line " + row.modelData.line
                 color: root.foreground
                 opacity: 0.5
                 font.family: root.fontFamily
@@ -587,8 +590,22 @@ Item {
                 width: Math.round(stage.sheetHeight / stage.aspect)
                 height: Math.round(stage.sheetHeight)
                 radius: Style.space(4)
-                color: root.hit && root.hit.image ? "transparent" : "#ffffff"
+                color: root.hit && root.hit.image ? "transparent" : root.preview.code ? Util.alpha(root.foreground, 0.07) : "#ffffff"
                 clip: true
+
+                // Source, with the line numbers the daemon put in front.
+                Text {
+                  textFormat: Text.PlainText
+                  anchors.fill: parent
+                  anchors.margins: Style.space(14)
+                  visible: !!root.preview.code
+                  text: root.preview.code || ""
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  wrapMode: Text.NoWrap
+                  clip: true
+                }
 
                 Image {
                   anchors.fill: parent

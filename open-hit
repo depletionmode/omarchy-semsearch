@@ -1,0 +1,31 @@
+#!/bin/bash
+# open-hit <path> <page> <line>
+#
+# Open a search hit where it matched: a PDF at its page, source at its line,
+# anything else with the default application. xdg-open cannot express a page
+# or a line, so the viewer or editor is addressed directly when it is one
+# whose option for that is known.
+
+path=${1:?} page=${2:-0} line=${3:-0}
+
+if ((page > 0)); then
+  viewer=$(xdg-mime query default application/pdf 2>/dev/null)
+  case "${viewer,,}" in
+  *evince*) exec evince --page-index="$page" "$path" ;;
+  *papers*) exec papers --page-index="$page" "$path" ;;
+  *zathura*) exec zathura --page="$page" "$path" ;;
+  *okular*) exec okular --page "$page" "$path" ;;
+  esac
+elif ((line > 0)); then
+  editor=nvim
+  defaults="$HOME/.local/state/omarchy/defaults/editor"
+  [[ -f $defaults ]] && read -r editor <"$defaults"
+  case "${editor##*/}" in
+  nvim | vim | nano | micro) exec omarchy-launch-editor "+$line" "$path" ;;
+  hx | helix | zed | zeditor) exec omarchy-launch-editor "$path:$line" ;;
+  code | code-insiders | codium | cursor) exec omarchy-launch-editor --goto "$path:$line" ;;
+  *) exec omarchy-launch-editor "$path" ;;
+  esac
+fi
+
+exec xdg-open "$path"

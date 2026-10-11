@@ -15,6 +15,6 @@ s.connect(os.environ["XDG_RUNTIME_DIR"] + "/semsearch.sock")
 s.sendall((json.dumps(req) + "\n").encode())
 resp = json.loads(s.makefile().readline())
 for hit in resp.get("hits", []):
-    page = " p.%d" % hit["page"] if hit["page"] else ""
-    print("%-7s %s/%s%s" % (hit["why"], hit["dir"], hit["name"], page))
+    where = " p.%d" % hit["page"] if hit["page"] else ":%d" % hit["line"] if hit["line"] else ""
+    print("%-7s %s/%s%s" % (hit["why"], hit["dir"], hit["name"], where))
 print(resp.get("error") or resp["status"], file=sys.stderr)

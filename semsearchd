@@ -1,14 +1,15 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["numpy>=1.26", "watchfiles>=0.21", "pillow>=10"]
+# dependencies = ["numpy>=1.26", "inotify-simple>=1.3", "pillow>=10"]
 # ///
 """semsearchd: local semantic search for the Semantic search Omarchy plugin.
 
-Indexes documents (as passages) and images, embeds them with EmbeddingGemma 2
-through a llama-server it starts on demand, and answers JSON-lines requests on
-a unix socket. Ranking fuses SQLite FTS5 (the literal words, in the text or the
-file path) with cosine similarity (the meaning, or what a picture shows).
+Indexes documents (as passages), source code (as function-sized blocks) and
+images, embeds them with EmbeddingGemma 2 through a llama-server it starts on
+demand, and answers JSON-lines requests on a unix socket. Ranking is by cosine
+similarity (the meaning, or what a picture shows), optionally fused with
+SQLite FTS5 (the literal words, in the text or the file path).
 """
 
 import base64
@@ -41,10 +42,17 @@ CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME + "/.config")) / "semsearch
 SOCKET = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "semsearch.sock"
 
 DEFAULTS = {
-    "roots": ["~/Documents", "~/Downloads", "~/Desktop", "~/Pictures"],
-    "exclude": ["node_modules", "__pycache__", "venv", "site-packages"],
+    # Everything below these is indexed, except hidden files and folders, the
+    # names in "exclude", and, inside a git repository, whatever git ignores.
+    "roots": ["~"],
+    # Folder names anywhere, or paths relative to a root when they contain "/".
+    "exclude": ["node_modules", "__pycache__", "venv", "site-packages", "vendor", "go/pkg"],
     "extensions": ["pdf", "md", "txt", "org", "rst", "docx", "odt"],
     "image_extensions": ["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"],
+    # Source files are searched as function-sized blocks.
+    "code_extensions": ["py", "js", "jsx", "ts", "tsx", "go", "rs", "c", "h", "cc", "cpp", "hpp", "java", "kt",
+                        "swift", "rb", "php", "cs", "lua", "sh", "sql", "qml", "nim", "zig", "sv", "v", "vhd"],
+    "max_code_kb": 300,
     "max_file_mb": 100,
     "max_pages": 500,
     "model": str(DATA / "models" / "embeddinggemma-2-Q8_0.gguf"),
@@ -58,10 +66,15 @@ DEFAULTS = {
     "min_similarity": 0.35,
     # The same for a picture against a text query, which scores lower.
     "min_image_similarity": 0.29,
+    "min_code_similarity": 0.35,
 }
+
+# What a row of the index is.
+TEXT, IMAGE, CODE = 0, 1, 2
 
 # Prompts from the google/embeddinggemma-2 model card.
 QUERY_PROMPT = "task: search result | query: "
+CODE_QUERY_PROMPT = "task: code retrieval | query: "
 DOC_PROMPT = "title: {title} | text: {text}"
 
 STOPWORDS = set(
@@ -130,6 +143,49 @@ def snippet(text, terms, width=170):
     return ("…" if start > 0 else "") + " ".join(out) + ("…" if end < len(words) else "")
 
 
+# A line that starts a definition, in most of the languages worth indexing:
+# a keyword at up to one level of indentation, a JS binding to a function, or
+# a C-style header at the left margin.
+DEFINITION = re.compile(
+    r"^[ \t]{0,4}(?:(?:export|default|public|private|protected|static|async|pub|abstract|final|override|inline"
+    r"|extern|unsafe)\s+)*(?:def|class|function\*?|fn|func|impl|struct|enum|trait|interface|type|module|proc"
+    r"|macro|sub)\b"
+    r"|^(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:async\s*)?(?:\(|function\b|\w+\s*=>)"
+    r"|^[A-Za-z_][\w \t*&:<>,\[\]]*\([^;{}]*\)\s*(?:const\s*)?\{?\s*$"
+)
+# Comments and decorators directly above a definition belong to it.
+LEAD_IN = re.compile(r"^\s*(?:#|//|/\*|\*|@|--)")
+
+
+def code_blocks(lines, merge=40, limit=80):
+    """Spans (first, last) of 1-based line numbers, one per function-sized
+    block: split at definitions, small neighbours merged, long ones windowed."""
+    if not lines:
+        return []
+    starts = [0]
+    for i, line in enumerate(lines):
+        if i and DEFINITION.match(line):
+            while i > starts[-1] + 1 and LEAD_IN.match(lines[i - 1]):
+                i -= 1
+            if i > starts[-1]:
+                starts.append(i)
+
+    merged = []
+    for a, b in zip(starts, starts[1:] + [len(lines)]):
+        if merged and b - merged[-1][0] <= merge:
+            merged[-1] = (merged[-1][0], b)
+        else:
+            merged.append((a, b))
+
+    spans = []
+    for a, b in merged:
+        if b - a <= limit:
+            spans.append((a + 1, b))
+        else:
+            spans.extend((a + w0 + 1, a + w1) for w0, w1 in windows(b - a, size=60, overlap=10))
+    return spans
+
+
 # --- Extraction -------------------------------------------------------------
 
 BBOX_PAGE = re.compile(r'<page width="([\d.]+)" height="([\d.]+)">(.*?)</page>', re.S)
@@ -186,8 +242,9 @@ def extract(path, max_pages):
         return [(0, zipped_xml_words(path, "word/document.xml"))]
     if ext == "odt":
         return [(0, zipped_xml_words(path, "content.xml"))]
+    # The first megabyte: a book is about that, and what is longer is a log.
     with open(path, "rb") as f:
-        return [(0, f.read(4 << 20).decode("utf-8", "replace").split())]
+        return [(0, f.read(1 << 20).decode("utf-8", "replace").split())]
 
 
 def image_size(path):
@@ -228,6 +285,19 @@ class LlamaEmbedder:
         self.port = 0
         self.active = 0
         self.last_used = 0.0
+        self.started = threading.Event()
+        if cfg["idle_unload_seconds"]:
+            threading.Thread(target=self._reap, daemon=True).start()
+
+    def _reap(self):
+        """Unload once idle. Blocks, without waking, for as long as nothing is loaded."""
+        idle = self.cfg["idle_unload_seconds"]
+        while True:
+            self.started.wait()
+            self.started.clear()
+            while self.loaded():
+                time.sleep(max(1.0, self.last_used + idle + 1 - time.monotonic()))
+                self.unload_if_idle()
 
     def loaded(self):
         return self.proc is not None and self.proc.poll() is None
@@ -252,6 +322,8 @@ class LlamaEmbedder:
             try:
                 urllib.request.urlopen("http://127.0.0.1:%d/health" % self.port, timeout=1)
                 log("vision model loaded" if self.vision else "text model loaded")
+                self.last_used = time.monotonic()
+                self.started.set()
                 return
             except OSError:
                 time.sleep(0.1)
@@ -321,9 +393,15 @@ class LlamaEmbedder:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, mtime REAL, size INTEGER, pages INTEGER);
-CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY, file_id INTEGER, image INTEGER, page INTEGER,
-                                  w0 INTEGER, w1 INTEGER, text TEXT, vec BLOB);
+-- kind is TEXT, IMAGE or CODE. w0 and w1 are the passage's word span on its
+-- page for TEXT, and its first and last line for CODE.
+-- hash identifies the embedded text, so identical passages are embedded once.
+CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY, file_id INTEGER, kind INTEGER, page INTEGER,
+                                  w0 INTEGER, w1 INTEGER, text TEXT, vec BLOB, hash BLOB);
+"""
+INDEXES = """
 CREATE INDEX IF NOT EXISTS chunks_file ON chunks(file_id);
+CREATE INDEX IF NOT EXISTS chunks_hash ON chunks(hash);
 """
 
 # No stemming: a word match means the word itself. Related forms are the
@@ -338,15 +416,34 @@ class Index:
         self.image_embedder = image_embedder or embedder
         self.cfg = cfg
         self.lock = threading.RLock()
+        self.text_extensions = set(cfg["extensions"])
         self.image_extensions = set(cfg["image_extensions"])
+        self.code_extensions = set(cfg["code_extensions"])
         self.ids = np.zeros(0, dtype=np.int64)
-        self.images = np.zeros(0, dtype=bool)
+        self.kinds = np.zeros(0, dtype=np.int8)
         self.matrix = np.zeros((0, 1), dtype=np.float32)
         self.means = {}
         self.stale = True
+        self.loaded_at = 0.0
         with self.lock, self.db:
             self.db.executescript(SCHEMA)
+            # Bring an index made by an earlier version up to date.
+            columns = {row[1] for row in self.db.execute("PRAGMA table_info(chunks)")}
+            if "image" in columns:
+                self.db.execute("ALTER TABLE chunks RENAME COLUMN image TO kind")
+            if "hash" not in columns:
+                self.db.execute("ALTER TABLE chunks ADD COLUMN hash BLOB")
+            self.db.executescript(INDEXES)
             self._ensure_fts()
+
+    def kind_of(self, path):
+        """TEXT, IMAGE or CODE by extension; None for a file that is not indexed."""
+        ext = path.rsplit(".", 1)[-1].lower()
+        if ext in self.image_extensions:
+            return IMAGE
+        if ext in self.code_extensions:
+            return CODE
+        return TEXT if ext in self.text_extensions else None
 
     def _ensure_fts(self):
         """Create the word index, or rebuild it from the stored passages when
@@ -398,24 +495,54 @@ class Index:
         if row == (st.st_mtime, st.st_size):
             return
 
-        title = os.path.basename(path).rsplit(".", 1)[0]
-        image = path.rsplit(".", 1)[-1].lower() in self.image_extensions
+        name = os.path.basename(path)
+        title = name.rsplit(".", 1)[0]
+        kind = self.kind_of(path)
         pages = []
         passages = []  # (page, w0, w1, text)
         vectors = []
-        if image:
+        hashes = []
+        if kind == IMAGE:
             # One vector for the picture itself. Icons and spacers are noise.
             if min(image_size(path)) >= 64:
                 passages = [(0, 0, 0, "")]
                 vectors = list(self.image_embedder.embed([image_input(path)]))
+                hashes = [None]
         else:
-            pages = extract(path, self.cfg["max_pages"])
-            for page, words in pages:
-                for w0, w1 in windows(len(words)):
-                    passages.append((page, w0, w1, " ".join(words[w0:w1])))
-            for i in range(0, len(passages), 8):
-                batch = [DOC_PROMPT.format(title=title, text=p[3]) for p in passages[i : i + 8]]
-                vectors.extend(self.embedder.embed(batch))
+            if kind == CODE:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    lines = f.read().split("\n")
+                # A line this long is minified or generated, not written.
+                if max(map(len, lines)) <= 1000:
+                    for first, last in code_blocks(lines):
+                        block = "\n".join(lines[first - 1 : last])
+                        if block.strip():
+                            passages.append((0, first, last, block))
+                title = name  # the model card's code documents are titled by file name
+            else:
+                pages = extract(path, self.cfg["max_pages"])
+                for page, words in pages:
+                    for w0, w1 in windows(len(words)):
+                        passages.append((page, w0, w1, " ".join(words[w0:w1])))
+            # A passage already embedded elsewhere (a copy of the file, another
+            # worktree of the repository) keeps the vector it has.
+            # The model reads about 2,000 tokens. Prose passages are far
+            # shorter; a "passage" of paths, base64 or one-line data is not,
+            # and is cut rather than sent whole. At the three characters a
+            # token that such text manages, 4,000 characters still fit.
+            prompts = [DOC_PROMPT.format(title=title, text=p[3][:4000]) for p in passages]
+            hashes = [hashlib.blake2b(prompt.encode(), digest_size=12).digest() for prompt in prompts]
+            vectors = [None] * len(prompts)
+            with self.lock:
+                for i, digest in enumerate(hashes):
+                    row = self.db.execute("SELECT vec FROM chunks WHERE hash=? LIMIT 1", (digest,)).fetchone()
+                    if row:
+                        vectors[i] = np.frombuffer(row[0], dtype=np.float32)
+            missing = [i for i, vec in enumerate(vectors) if vec is None]
+            for start in range(0, len(missing), 8):
+                batch = missing[start : start + 8]
+                for i, vec in zip(batch, self.embedder.embed([prompts[i] for i in batch])):
+                    vectors[i] = vec
 
         with self.lock, self.db:
             self._delete(path)
@@ -423,10 +550,10 @@ class Index:
                 "INSERT INTO files(path, mtime, size, pages) VALUES(?,?,?,?)",
                 (path, st.st_mtime, st.st_size, len(pages) if pages and pages[0][0] else 0),
             ).lastrowid
-            for n, ((page, w0, w1, text), vec) in enumerate(zip(passages, vectors)):
+            for n, ((page, w0, w1, text), vec, digest) in enumerate(zip(passages, vectors, hashes)):
                 chunk_id = self.db.execute(
-                    "INSERT INTO chunks(file_id, image, page, w0, w1, text, vec) VALUES(?,?,?,?,?,?,?)",
-                    (file_id, image, page, w0, w1, text, vec.astype(np.float32).tobytes()),
+                    "INSERT INTO chunks(file_id, kind, page, w0, w1, text, vec, hash) VALUES(?,?,?,?,?,?,?,?)",
+                    (file_id, kind, page, w0, w1, text, vec.astype(np.float32).tobytes(), digest),
                 ).lastrowid
                 self._add_words(chunk_id, path if n == 0 else "", text)
             self.stale = True
@@ -446,10 +573,13 @@ class Index:
 
     def _vectors(self):
         with self.lock:
-            if self.stale:
-                rows = self.db.execute("SELECT id, image, vec FROM chunks").fetchall()
+            # Reloading reads every vector, which grows with the index. While
+            # files are still being indexed a search may use a matrix that is
+            # a little behind, by at most about a second per 5,000 rows.
+            if self.stale and time.monotonic() - self.loaded_at >= len(self.ids) / 5000:
+                rows = self.db.execute("SELECT id, kind, vec FROM chunks").fetchall()
                 self.ids = np.array([r[0] for r in rows], dtype=np.int64)
-                self.images = np.array([r[1] for r in rows], dtype=bool)
+                self.kinds = np.array([r[1] for r in rows], dtype=np.int8)
                 matrix = np.frombuffer(b"".join(r[2] for r in rows), dtype=np.float32).reshape(len(rows), -1).copy()
                 # Every embedding shares a large common component (the mean
                 # vector has norm ~0.8), which leaves unrelated passages at a
@@ -457,15 +587,16 @@ class Index:
                 # the mean out, per kind, is what makes a threshold meaningful.
                 # With only a few rows the mean is just those rows, so it stays.
                 self.means = {}
-                for kind in (False, True):
-                    where = self.images == kind
+                for kind in (TEXT, IMAGE, CODE):
+                    where = self.kinds == kind
                     mean = matrix[where].mean(0) if where.sum() >= 20 else np.zeros(matrix.shape[1], np.float32)
                     self.means[kind] = mean
                     centred = matrix[where] - mean
                     matrix[where] = centred / np.maximum(np.linalg.norm(centred, axis=1, keepdims=True), 1e-9)
                 self.matrix = matrix
                 self.stale = False
-            return self.ids, self.images, self.matrix, self.means
+                self.loaded_at = time.monotonic()
+            return self.ids, self.kinds, self.matrix, self.means
 
     def _word_ranks(self, terms, joiner):
         """{chunk id: rank} of FTS matches, as typed or failing that with the
@@ -486,18 +617,21 @@ class Index:
         """Hits by meaning, and with words=True also by the literal words and
         file paths. semantic=False leaves the model out of it."""
         terms = query_terms(query)
-        ids, images, matrix, means = self._vectors()
+        ids, kinds, matrix, means = self._vectors()
 
-        # Passages and pictures are ranked apart: a picture scores lower
-        # against a text query than a passage does, so one list would bury them.
-        by_meaning, by_looks = {}, {}
+        # Passages, pictures and code are ranked apart: they score on different
+        # scales against a text query, so one list would bury two of them. Code
+        # is also asked for with the model's own code-retrieval prompt.
+        by_meaning, by_looks, by_code = {}, {}, {}
         if semantic and len(ids):
-            vector = self.embedder.embed([QUERY_PROMPT + query])[0]
-            for ranks, kind, floor, window in (
-                (by_meaning, False, self.cfg["min_similarity"], 0.12),
-                (by_looks, True, self.cfg["min_image_similarity"], 0.05),
+            has_code = bool((kinds == CODE).any())
+            vectors = self.embedder.embed([QUERY_PROMPT + query] + [CODE_QUERY_PROMPT + query] * has_code)
+            for ranks, kind, vector, floor, window in (
+                (by_meaning, TEXT, vectors[0], self.cfg["min_similarity"], 0.12),
+                (by_looks, IMAGE, vectors[0], self.cfg["min_image_similarity"], 0.05),
+                (by_code, CODE, vectors[-1], self.cfg["min_code_similarity"], 0.12),
             ):
-                where = np.flatnonzero(images == kind)
+                where = np.flatnonzero(kinds == kind)
                 if not len(where):
                     continue
                 centred = vector - means[kind]
@@ -509,7 +643,7 @@ class Index:
                 ranks.update((int(ids[where[i]]), rank) for rank, i in enumerate(order) if sims[i] >= floor)
 
         by_words = self._word_ranks(terms, " AND ") if words else {}
-        if words and semantic and not (by_words or by_meaning or by_looks):
+        if words and semantic and not (by_words or by_meaning or by_looks or by_code):
             # Nothing has all the words and nothing means the same: passages
             # with any of the words are better than an empty list. Only then,
             # because one common word of a long question matches almost anything.
@@ -518,26 +652,30 @@ class Index:
         # Reciprocal rank fusion of the lists. Pictures count for less: their
         # similarity to a text query separates good from bad less sharply.
         scores = {}
-        for ranks, weight in ((by_meaning, 1.0), (by_looks, 0.6), (by_words, 1.0)):
+        for ranks, weight in ((by_meaning, 1.0), (by_code, 1.0), (by_looks, 0.6), (by_words, 1.0)):
             for chunk_id, rank in ranks.items():
                 scores[chunk_id] = scores.get(chunk_id, 0.0) + weight / (60 + rank)
 
         hits = []
         seen_files = set()
+        seen_passages = set()
         for chunk_id in sorted(scores, key=scores.get, reverse=True):
             with self.lock:
                 row = self.db.execute(
-                    "SELECT f.id, f.path, f.mtime, f.size, f.pages, c.page, c.text, c.image "
+                    "SELECT f.id, f.path, f.mtime, f.size, f.pages, c.page, c.text, c.kind, c.w0, c.hash "
                     "FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.id=?", (chunk_id,)
                 ).fetchone()
-            if not row or row[0] in seen_files:
-                continue  # one row per document: its best passage
+            # One row per document, its best passage, and one per passage:
+            # copies of a file would otherwise fill the list with one answer.
+            if not row or row[0] in seen_files or (row[9] and row[9] in seen_passages):
+                continue
             seen_files.add(row[0])
-            _, path, mtime, size, pages, page, text, image = row
+            seen_passages.add(row[9])
+            _, path, mtime, size, pages, page, text, kind, w0, _ = row
             directory, name = os.path.split(path)
             excerpt = snippet(text, terms)
             if chunk_id not in by_words:
-                why = "looks" if image else "meaning"
+                why = "looks" if kind == IMAGE else "meaning"
             else:
                 why = "words" if "<b>" in excerpt else "name"
             hits.append({
@@ -550,7 +688,8 @@ class Index:
                 "pages": pages,
                 "mtime": int(mtime),
                 "size": size,
-                "image": bool(image),
+                "line": w0 if kind == CODE else 0,
+                "image": kind == IMAGE,
                 "why": why,
                 "snippet": excerpt,
             })
@@ -560,20 +699,24 @@ class Index:
 
     def preview(self, chunk_id, query):
         """What the preview pane shows for one hit: a page image with highlight
-        rects for a PDF, the picture for an image, a longer excerpt otherwise."""
+        rects for a PDF, the picture for an image, the block with line numbers
+        for code, a longer excerpt otherwise."""
         terms = query_terms(query)
         with self.lock:
             row = self.db.execute(
-                "SELECT f.path, f.mtime, c.page, c.w0, c.w1, c.text, c.image FROM chunks c "
+                "SELECT f.path, f.mtime, c.page, c.w0, c.w1, c.text, c.kind FROM chunks c "
                 "JOIN files f ON f.id = c.file_id "
                 "WHERE c.id=?", (chunk_id,)
             ).fetchone()
         if not row:
             return {}
-        path, mtime, page, w0, w1, text, image = row
-        if image:
+        path, mtime, page, w0, w1, text, kind = row
+        if kind == IMAGE:
             width, height = image_size(path)
             return {"image": path, "aspect": height / width, "passage": [], "terms": []}
+        if kind == CODE:
+            digits = len(str(w1))
+            return {"code": "\n".join("%*d  %s" % (digits, w0 + i, line) for i, line in enumerate(text.split("\n")))}
         if not page:
             return {"text": snippet(text, terms, width=1400)}
 
@@ -603,36 +746,92 @@ class Index:
 
 
 class Indexer:
-    """Queue of paths to (re)index or forget, fed by a startup reconcile and by
-    inotify, drained by one worker thread."""
+    """Queue of paths to (re)index or forget, fed by a reconcile at startup and
+    by inotify afterwards, drained by one worker thread."""
 
     def __init__(self, index, cfg):
         self.index = index
         self.cfg = cfg
-        self.roots = [r for r in (os.path.expanduser(r) for r in cfg["roots"]) if os.path.isdir(r)]
-        self.extensions = set(cfg["extensions"]) | set(cfg["image_extensions"])
-        self.exclude = set(cfg["exclude"])
+        self.roots = [r for r in (os.path.expanduser(r).rstrip("/") for r in cfg["roots"]) if os.path.isdir(r)]
+        self.exclude_names = {e for e in cfg["exclude"] if "/" not in e}
+        self.exclude_paths = [e.strip("/") for e in cfg["exclude"] if "/" in e]
         self.pending = {}  # insertion-ordered set
         self.cond = threading.Condition()
         self.total = 0
         self.done = 0
+        self.inotify = None
+        self.watches = {}  # watch descriptor -> directory
+
+    # What is indexed: files with a known extension below a root, outside
+    # hidden and excluded folders, and, inside a git repository, not ignored.
+
+    def skipped(self, path):
+        """Whether a path below a root is hidden or excluded, by its components."""
+        root = next((r for r in self.roots if path.startswith(r + "/")), None)
+        if root is None:
+            return True
+        rel = path[len(root) + 1 :]
+        return any(p.startswith(".") or p in self.exclude_names for p in rel.split("/")) or any(
+            rel == e or rel.startswith(e + "/") for e in self.exclude_paths
+        )
+
+    def repository(self, directory):
+        """Whether a directory is inside a git work tree, without leaving its root."""
+        root = next((r for r in self.roots if (directory + "/").startswith(r + "/")), directory)
+        while len(directory) >= len(root):
+            if os.path.exists(directory + "/.git"):
+                return True
+            directory = os.path.dirname(directory)
+        return False
+
+    def git(self, directory, *args):
+        # Repositories under a home directory include ones that were downloaded.
+        # These two settings are how a repository's own config can name a
+        # program for git to run, so they are overridden.
+        safe = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]
+        return subprocess.run(["git", *safe, "-C", directory, *args], capture_output=True, timeout=300)
+
+    def git_files(self, directory):
+        listing = self.git(directory, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+        return [os.path.join(directory, p) for p in listing.stdout.decode("utf-8", "replace").split("\0") if p]
+
+    def listing(self, top):
+        """Every indexable file below a directory."""
+        if self.repository(top):
+            candidates = self.git_files(top)
+        else:
+            candidates = []
+            stack = [top]
+            while stack:
+                directory = stack.pop()
+                try:
+                    entries = list(os.scandir(directory))
+                except OSError:
+                    continue
+                for entry in entries:
+                    if self.skipped(entry.path):
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if os.path.exists(entry.path + "/.git"):
+                            candidates.extend(self.git_files(entry.path))
+                        else:
+                            stack.append(entry.path)
+                    elif entry.is_file(follow_symlinks=False):
+                        candidates.append(entry.path)
+        return [
+            p for p in candidates if self.index.kind_of(p) is not None and not self.skipped(p) and os.path.isfile(p)
+        ]
 
     def wanted(self, path):
-        if path.rsplit(".", 1)[-1].lower() not in self.extensions:
+        """The same question for one path, as the watcher needs to ask it."""
+        if self.index.kind_of(path) is None or self.skipped(path):
             return False
-        root = next((r for r in self.roots if path.startswith(r + "/")), None)
-        if not root:
-            return False
-        parts = path[len(root) + 1 :].split("/")
-        return not any(p.startswith(".") or p in self.exclude for p in parts)
+        directory = os.path.dirname(path)
+        if self.repository(directory):
+            return self.git(directory, "check-ignore", "-q", path).returncode != 0
+        return True
 
-    def walk(self, top):
-        for directory, dirs, names in os.walk(top):
-            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in self.exclude]
-            for name in names:
-                path = os.path.join(directory, name)
-                if self.wanted(path):
-                    yield path
+    # The queue.
 
     def enqueue(self, paths):
         with self.cond:
@@ -642,40 +841,8 @@ class Indexer:
                     self.total += 1
             self.cond.notify()
 
-    def reconcile(self):
-        """Catch up with whatever changed while nothing was watching."""
-        known = self.index.known_files()
-        on_disk = set()
-        changed = []
-        for root in self.roots:
-            for path in self.walk(root):
-                on_disk.add(path)
-                try:
-                    st = os.stat(path)
-                except OSError:
-                    continue
-                if known.get(path) != (st.st_mtime, st.st_size):
-                    changed.append(path)
-        self.enqueue(changed + [p for p in known if p not in on_disk])
-        log("reconcile: %d to index, %d known" % (len(changed), len(known)))
-
-    def watch(self):
-        from watchfiles import watch
-
-        for changes in watch(*self.roots):
-            known = self.index.known_files()
-            paths = []
-            for _, path in changes:
-                if os.path.isdir(path):
-                    paths.extend(self.walk(path))  # a folder moved in
-                elif self.wanted(path) or path in known:
-                    paths.append(path)
-                # A folder moved or deleted takes its documents with it.
-                paths.extend(p for p in known if p.startswith(path + "/"))
-            self.enqueue(paths)
-
     def work(self):
-        limit = self.cfg["max_file_mb"] << 20
+        limits = {CODE: self.cfg["max_code_kb"] << 10}
         while True:
             with self.cond:
                 while not self.pending:
@@ -684,7 +851,8 @@ class Indexer:
                 path = next(iter(self.pending))
                 del self.pending[path]
             try:
-                if os.path.isfile(path) and self.wanted(path) and os.path.getsize(path) <= limit:
+                limit = limits.get(self.index.kind_of(path), self.cfg["max_file_mb"] << 20)
+                if os.path.isfile(path) and os.path.getsize(path) <= limit and self.wanted(path):
                     self.index.index_file(path)
                 else:
                     self.index.remove_file(path)
@@ -692,8 +860,85 @@ class Indexer:
                 log("skipped %s: %s" % (path, e))
             self.done += 1
 
+    def reconcile(self):
+        """Bring the index and the watches in line with the disk: what changed
+        while nothing was watching, and what the configuration now covers."""
+        known = self.index.known_files()
+        on_disk = set()
+        changed = []
+        for root in self.roots:
+            for path in self.listing(root):
+                on_disk.add(path)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                if known.get(path) != (st.st_mtime, st.st_size):
+                    changed.append(path)
+        self.enqueue(changed + [p for p in known if p not in on_disk])
+        self.watch_directories(on_disk)
+        log("reconcile: %d to index, %d known, %d directories watched" % (len(changed), len(known), len(self.watches)))
+
+    # Watching. One inotify watch per directory that holds an indexed file,
+    # and per ancestor up to the root so that a new folder is noticed. A
+    # recursive watch would also cover every node_modules and .git, which on a
+    # home directory is most of the watches a user is allowed.
+
+    def watch_directories(self, files):
+        if self.inotify is None:
+            return
+        from inotify_simple import flags
+
+        mask = flags.CLOSE_WRITE | flags.CREATE | flags.MOVED_TO | flags.MOVED_FROM | flags.DELETE | flags.ONLYDIR
+        watched = set(self.watches.values())
+        wanted = set()
+        for path in files:
+            directory = os.path.dirname(path)
+            while directory not in wanted and any((directory + "/").startswith(r + "/") for r in self.roots):
+                wanted.add(directory)
+                directory = os.path.dirname(directory)
+        for directory in wanted - watched:
+            try:
+                self.watches[self.inotify.add_watch(directory, mask)] = directory
+            except OSError as e:
+                log("cannot watch %s: %s" % (directory, e))
+
+    def watch(self):
+        from inotify_simple import INotify, flags
+
+        self.inotify = INotify()
+        self.reconcile()
+        while True:
+            # Blocks until something happens; then gathers what follows for a
+            # second, since a save or a checkout is rarely one event.
+            events = self.inotify.read(read_delay=1000)
+            paths = []
+            known = None
+            for event in events:
+                directory = self.watches.get(event.wd)
+                if directory is None:
+                    continue
+                if event.mask & flags.IGNORED:  # the directory itself is gone
+                    del self.watches[event.wd]
+                    continue
+                path = os.path.join(directory, event.name)
+                if not event.mask & flags.ISDIR:
+                    # work() indexes it if it is there and wanted, and forgets it otherwise.
+                    if self.index.kind_of(path) is not None:
+                        paths.append(path)
+                elif event.mask & (flags.CREATE | flags.MOVED_TO):
+                    if not self.skipped(path):
+                        new = self.listing(path)
+                        self.watch_directories(new)
+                        paths.extend(new)
+                else:
+                    # A folder moved away or deleted takes its files with it.
+                    known = known or self.index.known_files()
+                    paths.extend(p for p in known if p.startswith(path + "/"))
+            self.enqueue(paths)
+
     def start(self):
-        for target in (self.work, self.reconcile, self.watch):
+        for target in (self.work, self.watch):
             threading.Thread(target=target, daemon=True).start()
 
 
@@ -763,17 +1008,10 @@ def main():
     index.reset_if_model_changed(os.path.basename(cfg["model"]))
     indexer = Indexer(index, cfg)
 
-    def reap():
-        while True:
-            time.sleep(30)
-            embedder.unload_if_idle()
-            image_embedder.unload_if_idle()
-
     os.umask(0o077)
     SOCKET.unlink(missing_ok=True)
     server = Server(index, indexer, embedder)
     indexer.start()
-    threading.Thread(target=reap, daemon=True).start()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
         server.serve_forever()

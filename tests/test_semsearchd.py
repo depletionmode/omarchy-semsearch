@@ -1,5 +1,6 @@
-# Run with: uv run --with numpy --with watchfiles --with pillow --with pytest pytest tests/
+# Run with: uv run --with numpy --with inotify-simple --with pillow --with pytest pytest tests/
 import importlib.util
+import os
 import sqlite3
 import subprocess
 import time
@@ -246,3 +247,136 @@ def test_image_found_by_what_it_shows_and_by_path(tmp_path):
     assert (hit["name"], hit["why"]) == ("IMG_0042.png", "name")
 
     assert all(h["name"] != "icon.png" for h in index.search("sunset"))
+
+
+# --- Code -------------------------------------------------------------------
+
+SOURCE = """import os
+
+
+# Where the pipe is opened.
+@cached
+def open_pipe(name):
+    return os.open(name, os.O_RDONLY)
+
+
+class Ledger:
+    def tax(self, amount):
+        return amount * 0.2
+""" + "\n".join("    # filler %d" % i for i in range(60)) + """
+
+
+def bread():
+    return "loaf"
+"""
+
+
+def test_code_blocks_split_at_definitions_and_keep_lead_in_lines():
+    lines = SOURCE.split("\n")
+    spans = sd.code_blocks(lines)
+    assert spans[0][0] == 1 and spans[-1][1] == len(lines)
+    # Every line belongs to a block, in order.
+    assert all(b[0] <= a[1] + 1 for a, b in zip(spans, spans[1:]))
+    assert any(lines[first - 1].startswith("def bread") for first, _ in spans)
+    # Short neighbours share a block; left apart, the comment and decorator
+    # above open_pipe start its block rather than end the one before.
+    apart = sd.code_blocks(lines, merge=0)
+    assert len(apart) > len(spans)
+    assert any(lines[first - 1].startswith("# Where the pipe") for first, _ in apart)
+    assert sd.code_blocks([]) == []
+
+
+def test_code_is_found_by_block_with_its_line_number(tmp_path):
+    index = make_index(tmp_path)
+    source = tmp_path / "ledger.py"
+    source.write_text(SOURCE)
+    index.index_file(str(source))
+
+    hit = next(h for h in index.search("bread") if h["name"] == "ledger.py")
+    assert SOURCE.split("\n")[hit["line"] - 1] == "def bread():"
+    preview = index.preview(hit["chunk"], "bread")["code"]
+    assert preview.split("\n")[0].split() == [str(hit["line"]), "def", "bread():"]
+
+
+def test_identical_text_is_embedded_once_and_listed_once(tmp_path):
+    class Counting(FakeEmbedder):
+        calls = 0
+
+        def embed(self, texts):
+            Counting.calls += len(texts)
+            return super().embed(texts)
+
+    index = sd.Index(sqlite3.connect(":memory:", check_same_thread=False), Counting())
+    for folder in ("main", "worktree"):
+        (tmp_path / folder).mkdir()
+        (tmp_path / folder / "notes.txt").write_text("the advance tax payment is due each quarter")
+        index.index_file(str(tmp_path / folder / "notes.txt"))
+    assert Counting.calls == 1
+    assert index.stats()["files"] == 2
+    assert len(index.search("tax")) == 1
+
+
+def test_old_index_gains_the_new_columns():
+    db = sqlite3.connect(":memory:", check_same_thread=False)
+    db.execute("CREATE TABLE chunks(id INTEGER PRIMARY KEY, file_id INTEGER, image INTEGER, page INTEGER, "
+               "w0 INTEGER, w1 INTEGER, text TEXT, vec BLOB)")
+    sd.Index(db, FakeEmbedder())
+    assert {"kind", "hash"} <= {row[1] for row in db.execute("PRAGMA table_info(chunks)")}
+
+
+# --- What is indexed --------------------------------------------------------
+
+
+def make_indexer(root, **overrides):
+    cfg = dict(sd.DEFAULTS, roots=[str(root)], **overrides)
+    index = sd.Index(sqlite3.connect(":memory:", check_same_thread=False), FakeEmbedder(), cfg=cfg)
+    return sd.Indexer(index, cfg)
+
+
+def write(path, text="x"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def test_listing_skips_hidden_excluded_and_unknown_files(tmp_path):
+    for rel in ("notes.md", "sub/deep/app.py", "photo.png", ".secret.md", ".config/tool.md",
+                "node_modules/pkg/index.js", "go/pkg/mod/lib.go", "go/src/main.go", "movie.mkv"):
+        write(tmp_path / rel)
+    indexer = make_indexer(tmp_path)
+    found = {os.path.relpath(p, tmp_path) for p in indexer.listing(str(tmp_path))}
+    assert found == {"notes.md", "sub/deep/app.py", "photo.png", "go/src/main.go"}
+    assert indexer.wanted(str(tmp_path / "notes.md"))
+    assert not indexer.wanted(str(tmp_path / ".config/tool.md"))
+    assert not indexer.wanted(str(tmp_path / "go/pkg/mod/lib.go"))
+    assert not indexer.wanted("/etc/hostname.md")
+
+
+def test_inside_a_repository_only_what_git_does_not_ignore(tmp_path):
+    repo = tmp_path / "project"
+    for rel in ("src/main.py", "README.md", "build/out.js", "untracked.py"):
+        write(repo / rel)
+    write(repo / ".gitignore", "build/\n")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "src", "README.md", ".gitignore"], check=True)
+    write(tmp_path / "loose.txt")
+
+    indexer = make_indexer(tmp_path)
+    found = {os.path.relpath(p, tmp_path) for p in indexer.listing(str(tmp_path))}
+    # Untracked but not ignored counts: it is a file someone is writing.
+    assert found == {"loose.txt", "project/src/main.py", "project/README.md", "project/untracked.py"}
+    assert not indexer.wanted(str(repo / "build/out.js"))
+    assert indexer.wanted(str(repo / "src/main.py"))
+    # A folder created later inside the repository is listed the same way.
+    assert indexer.listing(str(repo / "build")) == []
+
+
+def test_watched_directories_are_the_ones_with_files_and_their_ancestors(tmp_path):
+    from inotify_simple import INotify
+
+    for rel in ("a/b/c/deep.md", "a/other/skip.bin", "top.md"):
+        write(tmp_path / rel)
+    indexer = make_indexer(tmp_path)
+    indexer.inotify = INotify()
+    indexer.watch_directories(indexer.listing(str(tmp_path)))
+    watched = {os.path.relpath(d, tmp_path) for d in indexer.watches.values()}
+    assert watched == {".", "a", "a/b", "a/b/c"}
