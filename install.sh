@@ -20,7 +20,7 @@ fail() {
 
 [[ $(uname -m) == x86_64 ]] || fail "only x86-64 is supported (the llama.cpp build is x64)"
 for tool in uv curl sha256sum tar pdftotext pdftoppm systemctl; do
-  command -v "$tool" >/dev/null || fail "missing dependency: $tool"
+  command -v "$tool" >/dev/null || fail "missing dependency: $tool (try: sudo pacman -S --needed uv poppler)"
 done
 
 here=$(dirname "$(readlink -f "$0")")
