@@ -65,11 +65,9 @@ DEFAULTS = {
     # after the corpus mean is subtracted (see Index._vectors).
     "min_similarity": 0.35,
     # The same for a picture against a text query, which scores lower.
-    "min_image_similarity": 0.29,
-    # The same when pictures are all that was asked for. Relevant pictures
-    # score anywhere from here up, and so does the odd irrelevant one, which
-    # is acceptable in a gallery someone chose to look at and not otherwise.
-    "min_gallery_similarity": 0.20,
+    # Relevant pictures score anywhere from here up (0.20 to 0.40 for "a
+    # face"), and so does the odd irrelevant one.
+    "min_image_similarity": 0.20,
     "min_code_similarity": 0.35,
 }
 
@@ -623,7 +621,6 @@ class Index:
         file paths. semantic=False leaves the model out of it. kind ("text",
         "code" or "image") narrows the hits to documents, source or pictures."""
         only = KINDS.get(kind)
-        gallery = only == IMAGE
         terms = query_terms(query)
         ids, kinds, matrix, means = self._vectors()
 
@@ -634,12 +631,11 @@ class Index:
         if semantic and len(ids):
             has_code = only in (None, CODE) and bool((kinds == CODE).any())
             vectors = self.embedder.embed([QUERY_PROMPT + query] + [CODE_QUERY_PROMPT + query] * has_code)
-            # Among everything, a picture has to stand out to be shown. When
-            # pictures are what was asked for, the best of them are the answer.
-            looks = ("min_gallery_similarity", 1.0) if gallery else ("min_image_similarity", 0.05)
+            # Pictures get no window below the best one: their relevant scores
+            # are spread too widely for that, and they rank last anyway.
             for ranks, kind, vector, floor, window in (
                 (by_meaning, TEXT, vectors[0], self.cfg["min_similarity"], 0.12),
-                (by_looks, IMAGE, vectors[0], self.cfg[looks[0]], looks[1]),
+                (by_looks, IMAGE, vectors[0], self.cfg["min_image_similarity"], 1.0),
                 (by_code, CODE, vectors[-1], self.cfg["min_code_similarity"], 0.12),
             ):
                 where = np.flatnonzero(kinds == kind)

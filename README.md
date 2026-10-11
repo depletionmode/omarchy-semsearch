@@ -66,9 +66,8 @@ it matched: it means something similar, it looks like what you described
 (pictures), it has your words, or its name matches. A PDF opens in the preview
 on the matching page with the passage highlighted.
 
-Among everything, a picture is only listed when it clearly stands out for the
-query. Narrowed to pictures, the best thirty or so are listed, most relevant
-first, so expect the tail to be loose.
+The kind only filters; the same hits are found either way. Pictures rank
+after documents and code, most relevant first, and their tail is loose.
 
 From a terminal: `semsearch status`, `semsearch rescan`, `semsearch <query>`,
 with `-w` to include word matches and `-k text|code|image` to narrow (in the
@@ -120,8 +119,7 @@ max_pages = 500            # of a PDF
 gpu_layers = 99            # 0 keeps the model off the GPU
 idle_unload_seconds = 300  # 0 keeps the model loaded
 min_similarity = 0.35
-min_image_similarity = 0.29
-min_gallery_similarity = 0.20  # when narrowed to pictures
+min_image_similarity = 0.20
 min_code_similarity = 0.35
 ```
 

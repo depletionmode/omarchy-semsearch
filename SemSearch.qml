@@ -23,8 +23,7 @@ Item {
   property bool waiting: false
   // Off: hits by meaning only. On: also the literal words and file paths.
   property bool wordMatch: false
-  // What the hits are narrowed to. Asking for pictures alone also makes the
-  // daemon generous with them: a gallery rather than only the stand-outs.
+  // What the hits are narrowed to. It only filters: All finds the same hits.
   property string kind: "all"
   readonly property var kinds: [
     { id: "all", label: "All" },
