@@ -451,3 +451,34 @@ def test_hits_are_listed_most_similar_first_and_word_matches_above(tmp_path):
     # mixed.txt is the weakest match by meaning and the only one with the word.
     hits = index.search("pipe bread", words=True)
     assert hits[0]["name"] == "mixed.txt" and hits[0]["why"] == "words"
+
+
+# --- Privacy ----------------------------------------------------------------
+
+
+def test_index_is_readable_by_its_owner_alone(tmp_path, monkeypatch):
+    data, cache = tmp_path / "data", tmp_path / "cache"
+    monkeypatch.setattr(sd, "DATA", data)
+    monkeypatch.setattr(sd, "CACHE", cache)
+
+    def mode(path):
+        return path.stat().st_mode & 0o777
+
+    # As a systemd user service inherits it, and as an earlier version left things.
+    previous = os.umask(0o022)
+    try:
+        data.mkdir()
+        (data / "index.db").touch()
+        assert (mode(data), mode(data / "index.db")) == (0o755, 0o644)
+
+        db = sd.open_database()
+        db.execute("CREATE TABLE t(x)")
+        db.commit()
+
+        assert mode(data) == mode(cache) == 0o700
+        files = sorted(p.name for p in data.iterdir())
+        assert "index.db-wal" in files
+        assert all(mode(data / name) == 0o600 for name in files)
+        db.close()
+    finally:
+        os.umask(previous)

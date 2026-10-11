@@ -168,7 +168,8 @@ first start `uv` installs `numpy`, `inotify-simple` and `pillow` into its cache.
 ## Privacy
 
 The index holds the text of your documents and source files in plain SQLite
-in your home directory. The daemon makes no network connections beyond a llama.cpp server
+in your home directory, readable by you alone (mode `0600`, in a `0700`
+directory), as are the rendered pages and the daemon's socket. The daemon makes no network connections beyond a llama.cpp server
 on a random `127.0.0.1` port; only `install.sh` downloads anything.
 
 ## Development
