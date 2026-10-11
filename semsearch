@@ -25,5 +25,6 @@ s.sendall((json.dumps(req) + "\n").encode())
 resp = json.loads(s.makefile().readline())
 for hit in resp.get("hits", []):
     where = " p.%d" % hit["page"] if hit["page"] else ":%d" % hit["line"] if hit["line"] else ""
-    print("%-7s %s/%s%s" % (hit["why"], hit["dir"], hit["name"], where))
+    score = "     " if hit["score"] > 1 else "%.3f" % hit["score"]  # a word match has no similarity
+    print("%-7s %s  %s/%s%s" % (hit["why"], score, hit["dir"], hit["name"], where))
 print(resp.get("error") or resp["status"], file=sys.stderr)

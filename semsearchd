@@ -624,15 +624,15 @@ class Index:
         terms = query_terms(query)
         ids, kinds, matrix, means = self._vectors()
 
-        # Passages, pictures and code are ranked apart: they score on different
-        # scales against a text query, so one list would bury two of them. Code
-        # is also asked for with the model's own code-retrieval prompt.
+        # {chunk id: similarity} for passages, pictures and code. Each kind is
+        # measured from its own mean and has its own floor; code is also asked
+        # for with the model's own code-retrieval prompt.
         by_meaning, by_looks, by_code = {}, {}, {}
         if semantic and len(ids):
             has_code = only in (None, CODE) and bool((kinds == CODE).any())
             vectors = self.embedder.embed([QUERY_PROMPT + query] + [CODE_QUERY_PROMPT + query] * has_code)
             # Pictures get no window below the best one: their relevant scores
-            # are spread too widely for that, and they rank last anyway.
+            # are spread too widely for that.
             for ranks, kind, vector, floor, window in (
                 (by_meaning, TEXT, vectors[0], self.cfg["min_similarity"], 0.12),
                 (by_looks, IMAGE, vectors[0], self.cfg["min_image_similarity"], 1.0),
@@ -647,7 +647,7 @@ class Index:
                 # There is always a nearest neighbour; only ones near the
                 # best, and above the floor, count as hits.
                 floor = max(floor, sims[order[0]] - window)
-                ranks.update((int(ids[where[i]]), rank) for rank, i in enumerate(order) if sims[i] >= floor)
+                ranks.update((int(ids[where[i]]), float(sims[i])) for i in order if sims[i] >= floor)
 
         by_words = self._word_ranks(terms, " AND ") if words else {}
         if words and semantic and not (by_words or by_meaning or by_looks or by_code):
@@ -656,12 +656,11 @@ class Index:
             # because one common word of a long question matches almost anything.
             by_words = self._word_ranks(terms, " OR ")
 
-        # Reciprocal rank fusion of the lists. Pictures count for less: their
-        # similarity to a text query separates good from bad less sharply.
-        scores = {}
-        for ranks, weight in ((by_meaning, 1.0), (by_code, 1.0), (by_looks, 0.6), (by_words, 1.0)):
-            for chunk_id, rank in ranks.items():
-                scores[chunk_id] = scores.get(chunk_id, 0.0) + weight / (60 + rank)
+        # Most similar first, whatever the kind. Word matches were asked for
+        # by name, so they go above all of those, in their own order.
+        scores = {**by_meaning, **by_code, **by_looks}
+        for chunk_id, rank in by_words.items():
+            scores[chunk_id] = 2.0 - rank / 1000
 
         hits = []
         seen_files = set()
@@ -700,6 +699,7 @@ class Index:
                 "line": w0 if kind == CODE else 0,
                 "image": kind == IMAGE,
                 "why": why,
+                "score": round(scores[chunk_id], 3),
                 "snippet": excerpt,
             })
             if len(hits) >= limit:

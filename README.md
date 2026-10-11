@@ -66,8 +66,9 @@ it matched: it means something similar, it looks like what you described
 (pictures), it has your words, or its name matches. A PDF opens in the preview
 on the matching page with the passage highlighted.
 
-The kind only filters; the same hits are found either way. Pictures rank
-after documents and code, most relevant first, and their tail is loose.
+The kind only filters; the same hits are found either way. Hits are listed
+most similar first, whatever their kind, with word matches above them when
+those are on.
 
 From a terminal: `semsearch status`, `semsearch rescan`, `semsearch <query>`,
 with `-w` to include word matches and `-k text|code|image` to narrow (in the
@@ -128,8 +129,9 @@ min_code_similarity = 0.35
 `semsearchd` embeds every passage, code block and picture and stores text and
 vectors in `~/.local/share/semsearch/index.db`. A query is ranked against
 each of the three (cosine similarity after subtracting that kind's mean
-vector; code with the model's code-retrieval prompt). With word matches on, literal words (SQLite FTS5, no stemming) are a
-third list, and the lists are fused by reciprocal rank.
+vector; code with the model's code-retrieval prompt) and listed by that
+score. With word matches on, literal words (SQLite FTS5, no stemming) are
+listed first.
 
 The model is loaded on demand and unloaded after five idle minutes. Searching
 loads only the text model (310 MB); the vision projector (555 MB) is loaded

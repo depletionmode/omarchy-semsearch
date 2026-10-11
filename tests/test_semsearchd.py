@@ -419,3 +419,22 @@ def test_search_can_be_narrowed_to_one_kind(tmp_path):
     # Word matches are narrowed too: "sunset" is written in the source file.
     assert names("sunset", words=True, semantic=False) == {"ledger.py"}
     assert names("sunset", words=True, semantic=False, kind="text") == set()
+
+
+def test_hits_are_listed_most_similar_first_and_word_matches_above(tmp_path):
+    from PIL import Image
+
+    index = make_index(tmp_path)
+    Image.new("RGB", (80, 80), "orange").save(tmp_path / "IMG_1.png")
+    (tmp_path / "mixed.txt").write_text("tax and bread and a pipe")
+    for name in ("IMG_1.png", "mixed.txt"):
+        index.index_file(str(tmp_path / name))
+
+    # A picture and a document in one list, in order of score.
+    hits = index.search("sunset tax")
+    assert {"return.txt", "IMG_1.png"} <= {h["name"] for h in hits}
+    assert [h["score"] for h in hits] == sorted((h["score"] for h in hits), reverse=True)
+
+    # mixed.txt is the weakest match by meaning and the only one with the word.
+    hits = index.search("pipe bread", words=True)
+    assert hits[0]["name"] == "mixed.txt" and hits[0]["why"] == "words"
